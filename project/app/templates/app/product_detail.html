@@ -1,0 +1,185 @@
+{% extends 'app/base.html' %}
+
+{% block title %}{{ product.name|truncatechars:50 }} - Wildberries Parser{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb">
+                <li class="breadcrumb-item"><a href="{% url 'app:index' %}">Главная</a></li>
+                <li class="breadcrumb-item"><a href="{% url 'app:products_list' %}">Товары</a></li>
+                <li class="breadcrumb-item active">{{ product.name|truncatechars:30 }}</li>
+            </ol>
+        </nav>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Основная информация о товаре -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h4><i class="fas fa-box"></i> Информация о товаре</h4>
+            </div>
+            <div class="card-body">
+                <h5 class="card-title">{{ product.name }}</h5>
+                
+                <!-- Цены -->
+                <div class="mb-3">
+                    {% if product.has_discount %}
+                        <div class="d-flex align-items-center">
+                            <span class="text-decoration-line-through text-muted fs-4">{{ product.price }}₽</span>
+                            <span class="discount-price fs-3 fw-bold ms-3">{{ product.discount_price }}₽</span>
+                            <span class="badge bg-danger fs-6 ms-2">-{{ product.discount_percentage }}%</span>
+                        </div>
+                    {% else %}
+                        <span class="price fs-3">{{ product.price }}₽</span>
+                    {% endif %}
+                </div>
+                
+                <!-- Рейтинг и отзывы -->
+                {% if product.rating or product.reviews_count is not None %}
+                    <div class="mb-3">
+                        {% if product.rating %}
+                            <span class="rating fs-5">
+                                <i class="fas fa-star"></i> {{ product.rating }}
+                            </span>
+                        {% endif %}
+                        <span class="ms-2 text-muted">
+                            <i class="fas fa-comment-dots"></i> {{ product.reviews_count }} отзывов
+                        </span>
+                    </div>
+                {% endif %}
+                
+                <!-- Мета-информация -->
+                <div class="row mb-3">
+                    {% if product.category %}
+                        <div class="col-md-6">
+                            <strong>Категория:</strong> 
+                            <span class="badge bg-secondary">{{ product.category }}</span>
+                        </div>
+                    {% endif %}
+                    {% if product.search_query %}
+                        <div class="col-md-6">
+                            <strong>Поисковый запрос:</strong> 
+                            <span class="badge bg-info">{{ product.search_query }}</span>
+                        </div>
+                    {% endif %}
+                </div>
+                
+                <!-- Даты -->
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <strong>Добавлен:</strong> {{ product.created_at|date:"d.m.Y H:i" }}
+                    </div>
+                    <div class="col-md-6">
+                        <strong>Обновлен:</strong> {{ product.updated_at|date:"d.m.Y H:i" }}
+                    </div>
+                </div>
+                
+                <!-- ID товара -->
+                <div class="mb-3">
+                    <strong>ID товара:</strong> <code>{{ product.product_id }}</code>
+                </div>
+                
+                <!-- Кнопки действий -->
+                <div class="d-flex gap-2">
+                    <a href="{{ product.product_url }}" target="_blank" class="btn btn-primary">
+                        <i class="fas fa-external-link-alt"></i> Открыть на Wildberries
+                    </a>
+                    <a href="{% url 'app:products_list' %}" class="btn btn-outline-secondary">
+                        <i class="fas fa-arrow-left"></i> Назад к списку
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Статистика -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-chart-bar"></i> Статистика</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <strong>Цена:</strong><br>
+                    <span class="fs-5">{{ product.price }}₽</span>
+                </div>
+                
+                {% if product.discount_price %}
+                    <div class="mb-3">
+                        <strong>Цена со скидкой:</strong><br>
+                        <span class="fs-5 discount-price">{{ product.discount_price }}₽</span>
+                    </div>
+                {% endif %}
+                
+                {% if product.rating %}
+                    <div class="mb-3">
+                        <strong>Рейтинг:</strong><br>
+                        <span class="rating fs-5">{{ product.rating }}/5</span>
+                    </div>
+                {% endif %}
+                
+                {% if product.reviews_count %}
+                    <div class="mb-3">
+                        <strong>Отзывов:</strong><br>
+                        <span class="fs-5">{{ product.reviews_count }}</span>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Похожие товары -->
+{% if similar_products %}
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-thumbs-up"></i> Похожие товары</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% for similar in similar_products %}
+                    <div class="col-md-6 col-lg-4 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h6 class="card-title">{{ similar.name|truncatechars:50 }}</h6>
+                                
+                                <div class="mb-2">
+                                    {% if similar.has_discount %}
+                                        <span class="text-decoration-line-through text-muted">{{ similar.price }}₽</span>
+                                        <span class="discount-price ms-2">{{ similar.discount_price }}₽</span>
+                                    {% else %}
+                                        <span class="price">{{ similar.price }}₽</span>
+                                    {% endif %}
+                                </div>
+                                
+                                {% if similar.rating %}
+                                    <div class="mb-2">
+                                        <span class="rating">
+                                            <i class="fas fa-star"></i> {{ similar.rating }}
+                                        </span>
+                                        {% if similar.reviews_count %}
+                                            <small class="text-muted">({{ similar.reviews_count }})</small>
+                                        {% endif %}
+                                    </div>
+                                {% endif %}
+                                
+                                <a href="{% url 'app:product_detail' similar.id %}" class="btn btn-sm btn-outline-primary">
+                                    <i class="fas fa-eye"></i> Подробнее
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %} 

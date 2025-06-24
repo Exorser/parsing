@@ -1,0 +1,263 @@
+{% extends 'app/base.html' %}
+
+{% block title %}Поиск товаров - Wildberries Parser{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h1 class="mb-4">
+            <i class="fas fa-search text-primary"></i> 
+            Поиск товаров
+        </h1>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-8 mx-auto">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-cogs"></i> Настройки парсинга</h5>
+            </div>
+            <div class="card-body">
+                <form id="searchForm">
+                    <div class="mb-3">
+                        <label for="query" class="form-label">
+                            <i class="fas fa-search"></i> Поисковый запрос *
+                        </label>
+                        <input type="text" class="form-control" id="query" name="query" 
+                               placeholder="Например: iPhone, ноутбук, кроссовки..." required>
+                        <div class="form-text">Введите название товара или категорию для поиска</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="category" class="form-label">
+                            <i class="fas fa-tags"></i> Категория (опционально)
+                        </label>
+                        <input type="text" class="form-control" id="category" name="category" 
+                               placeholder="Например: Электроника, Одежда, Обувь...">
+                        <div class="form-text">Укажите конкретную категорию для более точного поиска</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="limit" class="form-label">
+                            <i class="fas fa-list-ol"></i> Количество товаров
+                        </label>
+                        <select class="form-select" id="limit" name="limit">
+                            <option value="5">5 товаров</option>
+                            <option value="10" selected>10 товаров</option>
+                            <option value="20">20 товаров</option>
+                            <option value="50">50 товаров</option>
+                        </select>
+                        <div class="form-text">Количество товаров для парсинга</div>
+                    </div>
+
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-primary btn-lg" id="startBtn">
+                            <i class="fas fa-play"></i> Начать парсинг
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Прогресс парсинга -->
+        <div class="card mt-4" id="progressCard" style="display: none;">
+            <div class="card-header">
+                <h5><i class="fas fa-spinner fa-spin"></i> Парсинг в процессе...</h5>
+            </div>
+            <div class="card-body">
+                <div class="progress mb-3">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                         role="progressbar" style="width: 0%" id="progressBar">0%</div>
+                </div>
+                <div id="statusText">Подготовка к парсингу...</div>
+            </div>
+        </div>
+
+        <!-- Результаты -->
+        <div class="card mt-4" id="resultsCard" style="display: none;">
+            <div class="card-header">
+                <h5><i class="fas fa-check-circle text-success"></i> Результаты парсинга</h5>
+            </div>
+            <div class="card-body">
+                <div id="resultsContent"></div>
+                <div class="mt-3">
+                    <a href="{% url 'app:products_list' %}" class="btn btn-primary">
+                        <i class="fas fa-list"></i> Просмотреть все товары
+                    </a>
+                    <button type="button" class="btn btn-outline-secondary" onclick="resetForm()">
+                        <i class="fas fa-redo"></i> Новый поиск
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Примеры запросов -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-lightbulb"></i> Примеры популярных запросов</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('iPhone')">
+                            iPhone
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('ноутбук')">
+                            Ноутбук
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('кроссовки')">
+                            Кроссовки
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('платье')">
+                            Платье
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('телевизор')">
+                            Телевизор
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('наушники')">
+                            Наушники
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('книга')">
+                            Книги
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-outline-primary btn-sm w-100" onclick="setQuery('игрушка')">
+                            Игрушка
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function setQuery(query) {
+    document.getElementById('query').value = query;
+}
+
+function resetForm() {
+    document.getElementById('searchForm').reset();
+    document.getElementById('progressCard').style.display = 'none';
+    document.getElementById('resultsCard').style.display = 'none';
+}
+
+document.getElementById('searchForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const formData = new FormData(this);
+    const data = {
+        query: formData.get('query'),
+        category: formData.get('category'),
+        limit: parseInt(formData.get('limit'))
+    };
+    
+    // Показываем прогресс
+    document.getElementById('progressCard').style.display = 'block';
+    document.getElementById('resultsCard').style.display = 'none';
+    document.getElementById('startBtn').disabled = true;
+    
+    // Симулируем прогресс
+    let progress = 0;
+    const progressBar = document.getElementById('progressBar');
+    const statusText = document.getElementById('statusText');
+    
+    const progressInterval = setInterval(() => {
+        progress += Math.random() * 15;
+        if (progress > 90) progress = 90;
+        progressBar.style.width = progress + '%';
+        progressBar.textContent = Math.round(progress) + '%';
+        
+        if (progress < 30) {
+            statusText.textContent = 'Подключение к Wildberries...';
+        } else if (progress < 60) {
+            statusText.textContent = 'Парсинг товаров...';
+        } else {
+            statusText.textContent = 'Сохранение данных...';
+        }
+    }, 500);
+    
+    // Отправляем запрос
+    fetch('{% url "app:start_parsing" %}', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]')?.value || ''
+        },
+        body: JSON.stringify(data)
+    })
+    .then(response => response.json())
+    .then(result => {
+        clearInterval(progressInterval);
+        progressBar.style.width = '100%';
+        progressBar.textContent = '100%';
+        statusText.textContent = 'Парсинг завершен!';
+        
+        setTimeout(() => {
+            document.getElementById('progressCard').style.display = 'none';
+            document.getElementById('resultsCard').style.display = 'block';
+            document.getElementById('startBtn').disabled = false;
+            
+            const resultsContent = document.getElementById('resultsContent');
+            if (result.success) {
+                resultsContent.innerHTML = `
+                    <div class="alert alert-success">
+                        <i class="fas fa-check-circle"></i> ${result.message}
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <strong>Сохранено товаров:</strong> ${result.saved_count}
+                        </div>
+                        <div class="col-md-6">
+                            <strong>Запрос:</strong> ${data.query}
+                        </div>
+                        <div class="col-md-6">
+                            <strong>Категория:</strong> ${data.category || 'Не указана'}
+                        </div>
+                    </div>
+                `;
+            } else {
+                resultsContent.innerHTML = `
+                    <div class="alert alert-danger">
+                        <i class="fas fa-exclamation-triangle"></i> Ошибка: ${result.error}
+                    </div>
+                `;
+            }
+        }, 1000);
+    })
+    .catch(error => {
+        clearInterval(progressInterval);
+        document.getElementById('progressCard').style.display = 'none';
+        document.getElementById('startBtn').disabled = false;
+        
+        const resultsContent = document.getElementById('resultsContent');
+        resultsContent.innerHTML = `
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-triangle"></i> Ошибка соединения: ${error.message}
+            </div>
+        `;
+        document.getElementById('resultsCard').style.display = 'block';
+    });
+});
+</script>
+{% endblock %} 

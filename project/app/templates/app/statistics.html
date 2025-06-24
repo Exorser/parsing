@@ -1,0 +1,155 @@
+{% extends 'app/base.html' %}
+
+{% block title %}Статистика - Wildberries Parser{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h1 class="mb-4">
+            <i class="fas fa-chart-bar text-primary"></i> 
+            Статистика
+        </h1>
+    </div>
+</div>
+
+<!-- Общая статистика -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <i class="fas fa-box fa-2x text-primary mb-2"></i>
+                <h3 class="card-title">{{ total_products }}</h3>
+                <p class="card-text">Всего товаров</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <i class="fas fa-tags fa-2x text-success mb-2"></i>
+                <h3 class="card-title">{{ total_categories }}</h3>
+                <p class="card-text">Категорий</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <i class="fas fa-search fa-2x text-info mb-2"></i>
+                <h3 class="card-title">{{ total_queries }}</h3>
+                <p class="card-text">Поисковых запросов</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <i class="fas fa-percentage fa-2x text-warning mb-2"></i>
+                <h3 class="card-title">{{ discounted_products }}</h3>
+                <p class="card-text">Товаров со скидкой</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Статистика по ценам -->
+{% if price_stats.avg_price %}
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-ruble-sign"></i> Статистика по ценам</h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3 text-center">
+                        <h4 class="text-primary">{{ price_stats.avg_price|floatformat:0 }}₽</h4>
+                        <p class="text-muted">Средняя цена</p>
+                    </div>
+                    <div class="col-md-3 text-center">
+                        <h4 class="text-success">{{ price_stats.min_price|floatformat:0 }}₽</h4>
+                        <p class="text-muted">Минимальная цена</p>
+                    </div>
+                    <div class="col-md-3 text-center">
+                        <h4 class="text-danger">{{ price_stats.max_price|floatformat:0 }}₽</h4>
+                        <p class="text-muted">Максимальная цена</p>
+                    </div>
+                    <div class="col-md-3 text-center">
+                        <h4 class="text-info">{{ price_stats.avg_rating|floatformat:1|default:"Н/Д" }}</h4>
+                        <p class="text-muted">Средний рейтинг</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Топ категорий -->
+{% if top_categories %}
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-tags"></i> Топ категорий</h5>
+            </div>
+            <div class="card-body">
+                {% for category in top_categories %}
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>{{ category.category|default:"Без категории" }}</span>
+                    <span class="badge bg-primary">{{ category.count }}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+    
+    <!-- Топ поисковых запросов -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-search"></i> Топ поисковых запросов</h5>
+            </div>
+            <div class="card-body">
+                {% for query in top_queries %}
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>{{ query.search_query }}</span>
+                    <span class="badge bg-info">{{ query.count }}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Графики (заглушка) -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-chart-line"></i> Динамика добавления товаров</h5>
+            </div>
+            <div class="card-body">
+                <div class="text-center py-5">
+                    <i class="fas fa-chart-line fa-3x text-muted mb-3"></i>
+                    <h6>Графики будут добавлены в следующей версии</h6>
+                    <p class="text-muted">Здесь будут отображаться графики динамики цен, количества товаров и другие аналитические данные</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Действия -->
+<div class="row mt-4">
+    <div class="col-12 text-center">
+        <a href="{% url 'app:search_form' %}" class="btn btn-primary me-2">
+            <i class="fas fa-plus"></i> Добавить товары
+        </a>
+        <a href="{% url 'app:products_list' %}" class="btn btn-outline-primary me-2">
+            <i class="fas fa-list"></i> Просмотреть товары
+        </a>
+    </div>
+</div>
+{% endblock %} 
