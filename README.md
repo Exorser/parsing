@@ -1,5 +1,7 @@
 # Wildberries Parser
 
+![Wildberries Parser](image.png)
+
 Парсер товаров с сайта Wildberries на Django с использованием requests + XHR запросов.
 
 ## Особенности
