@@ -1,15 +1,24 @@
-from django.urls import path
-from . import views
+from django.urls import path, re_path, include
+from rest_framework.routers import DefaultRouter
+from .views import (
+    FrontendAppView, 
+    ProductViewSet,
+    start_parsing
+)
 
 app_name = 'app'
 
+# Создаем router для API
+router = DefaultRouter()
+router.register(r'products', ProductViewSet, basename='product')
+
 urlpatterns = [
-    path('', views.index, name='index'),
-    path('search/', views.search_form, name='search_form'),
-    path('products/', views.products_list, name='products_list'),
-    path('product/<int:product_id>/', views.product_detail, name='product_detail'),
-    path('statistics/', views.statistics, name='statistics'),
-    path('api/price_histogram/', views.price_histogram_data, name='price_histogram_data'),
-    path('api/discount_vs_rating/', views.discount_vs_rating_data, name='discount_vs_rating_data'),
-    path('api/start-parsing/', views.start_parsing, name='start_parsing'),
+    # API endpoints через router
+    path('api/', include(router.urls)),
+    path('api/start-parsing/', start_parsing, name='api_start_parsing'),
+]
+
+# Маршрут для SPA (React) - должен быть последним
+urlpatterns += [
+    re_path(r'^(?!api/).*$', FrontendAppView.as_view(), name='frontend'),
 ] 

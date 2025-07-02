@@ -210,4 +210,10 @@ class WildberriesParser:
         saved_count = self.save_products(products)
         
         logger.info(f"Парсинг завершен! Сохранено товаров: {saved_count}")
-        return saved_count 
+        return saved_count
+
+    def parse_products(self, query: str, category: str = "", limit: int = 10) -> int:
+        """
+        Алиас для parse_and_save для совместимости с API
+        """
+        return self.parse_and_save(query, category, limit) 
