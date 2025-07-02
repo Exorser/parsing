@@ -53,6 +53,84 @@ class ProductPagination(PageNumberPagination):
     max_page_size = 100
 
 
+def get_filtered_products(request):
+    """
+    Возвращает QuerySet товаров с применёнными фильтрами из request.GET
+    """
+    products = Product.objects.annotate(
+        actual_price=Case(
+            When(discount_price__isnull=False, discount_price__lt=F('price'),
+                 then=F('discount_price')),
+            default=F('price'),
+            output_field=DecimalField(max_digits=10, decimal_places=2)
+        )
+    )
+
+    # Фильтрация
+    search_query = request.GET.get('search', '')
+    if search_query:
+        products = products.filter(
+            Q(name__icontains=search_query) |
+            Q(search_query__icontains=search_query)
+        )
+
+    category = request.GET.get('category', '')
+    if category:
+        products = products.filter(category__icontains=category)
+
+    min_price = request.GET.get('min_price', '')
+    if min_price:
+        try:
+            products = products.filter(actual_price__gte=float(min_price))
+        except ValueError:
+            pass
+
+    max_price = request.GET.get('max_price', '')
+    if max_price:
+        try:
+            products = products.filter(actual_price__lte=float(max_price))
+        except ValueError:
+            pass
+
+    min_rating = request.GET.get('min_rating', '')
+    if min_rating:
+        try:
+            rating = float(min_rating)
+            if 0 <= rating <= 5:
+                products = products.filter(rating__gte=rating)
+        except ValueError:
+            pass
+
+    max_rating = request.GET.get('max_rating', '')
+    if max_rating:
+        try:
+            rating = float(max_rating)
+            if 0 <= rating <= 5:
+                products = products.filter(rating__lte=rating)
+        except ValueError:
+            pass
+
+    min_reviews = request.GET.get('min_reviews', '')
+    if min_reviews:
+        try:
+            reviews = int(min_reviews)
+            if reviews >= 0:
+                products = products.filter(reviews_count__gte=reviews)
+        except ValueError:
+            pass
+
+    max_reviews = request.GET.get('max_reviews', '')
+    if max_reviews:
+        try:
+            reviews = int(max_reviews)
+            if reviews >= 0:
+                products = products.filter(reviews_count__lte=reviews)
+        except ValueError:
+            pass
+
+    return products
+
+
 class ProductViewSet(ViewSet):
     """
     ViewSet для работы с товарами
@@ -63,81 +141,7 @@ class ProductViewSet(ViewSet):
         """
         Список товаров с фильтрацией, сортировкой и пагинацией
         """
-        # Базовый queryset с актуальной ценой
-        products = Product.objects.annotate(
-            actual_price=Case(
-                When(discount_price__isnull=False, discount_price__lt=F('price'), 
-                     then=F('discount_price')),
-                default=F('price'),
-                output_field=DecimalField(max_digits=10, decimal_places=2)
-            )
-        )
-
-        # Фильтрация
-        search_query = request.GET.get('search', '')
-        if search_query:
-            products = products.filter(
-                Q(name__icontains=search_query) | 
-                Q(search_query__icontains=search_query)
-            )
-
-        category = request.GET.get('category', '')
-        if category:
-            products = products.filter(category__icontains=category)
-
-        # Фильтры по цене
-        min_price = request.GET.get('min_price', '')
-        if min_price:
-            try:
-                products = products.filter(actual_price__gte=float(min_price))
-            except ValueError:
-                pass
-
-        max_price = request.GET.get('max_price', '')
-        if max_price:
-            try:
-                products = products.filter(actual_price__lte=float(max_price))
-            except ValueError:
-                pass
-
-        # Фильтры по рейтингу
-        min_rating = request.GET.get('min_rating', '')
-        if min_rating:
-            try:
-                rating = float(min_rating)
-                if 0 <= rating <= 5:
-                    products = products.filter(rating__gte=rating)
-            except ValueError:
-                pass
-
-        max_rating = request.GET.get('max_rating', '')
-        if max_rating:
-            try:
-                rating = float(max_rating)
-                if 0 <= rating <= 5:
-                    products = products.filter(rating__lte=rating)
-            except ValueError:
-                pass
-
-        # Фильтры по отзывам
-        min_reviews = request.GET.get('min_reviews', '')
-        if min_reviews:
-            try:
-                reviews = int(min_reviews)
-                if reviews >= 0:
-                    products = products.filter(reviews_count__gte=reviews)
-            except ValueError:
-                pass
-
-        max_reviews = request.GET.get('max_reviews', '')
-        if max_reviews:
-            try:
-                reviews = int(max_reviews)
-                if reviews >= 0:
-                    products = products.filter(reviews_count__lte=reviews)
-            except ValueError:
-                pass
-
+        products = get_filtered_products(request)
         # Сортировка
         sort_by = request.GET.get('sort', '-created_at')
         sort_options = {
@@ -183,14 +187,14 @@ class ProductViewSet(ViewSet):
                 'max': int(price_range['max_price'] or 100000)
             },
             'filters': {
-                'search': search_query,
-                'category': category,
-                'min_price': min_price,
-                'max_price': max_price,
-                'min_rating': min_rating,
-                'max_rating': max_rating,
-                'min_reviews': min_reviews,
-                'max_reviews': max_reviews,
+                'search': request.GET.get('search', ''),
+                'category': request.GET.get('category', ''),
+                'min_price': request.GET.get('min_price', ''),
+                'max_price': request.GET.get('max_price', ''),
+                'min_rating': request.GET.get('min_rating', ''),
+                'max_rating': request.GET.get('max_rating', ''),
+                'min_reviews': request.GET.get('min_reviews', ''),
+                'max_reviews': request.GET.get('max_reviews', ''),
                 'sort': sort_by,
             }
         })
@@ -287,14 +291,7 @@ class ProductViewSet(ViewSet):
         """
         Данные для гистограммы цен
         """
-        products = Product.objects.annotate(
-            actual_price=Case(
-                When(discount_price__isnull=False, discount_price__lt=F('price'), 
-                     then=F('discount_price')),
-                default=F('price'),
-                output_field=DecimalField(max_digits=10, decimal_places=2)
-            )
-        ).filter(actual_price__isnull=False)
+        products = get_filtered_products(request).filter(actual_price__isnull=False)
 
         # Группировка по диапазонам цен
         price_ranges = [
@@ -325,7 +322,7 @@ class ProductViewSet(ViewSet):
         """
         Данные зависимости скидки от рейтинга
         """
-        products = Product.objects.filter(
+        products = get_filtered_products(request).filter(
             discount_price__isnull=False,
             discount_price__lt=F('price'),
             rating__isnull=False
@@ -371,12 +368,13 @@ def start_parsing(request):
         data = json.loads(request.body)
         search_query = data.get('search_query', '')
         category = data.get('category', '')
+        limit = data.get('limit', 10)
         
         if not search_query:
             return JsonResponse({'error': 'Не указан поисковый запрос'}, status=400)
         
         parser = WildberriesParser()
-        parser.parse_products(search_query, category=category)
+        parser.parse_products(search_query, category=category, limit=limit)
         
         return JsonResponse({'message': 'Парсинг запущен успешно'})
         

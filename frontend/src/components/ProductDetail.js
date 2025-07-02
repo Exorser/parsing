@@ -2,7 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import axios from 'axios';
 import './ProductDetail.css';
+import PropTypes from 'prop-types';
 
+/**
+ * Детальная страница товара Wildberries
+ * @component
+ */
 function ProductDetail() {
   const { id } = useParams();
   const [product, setProduct] = useState(null);
@@ -104,14 +109,16 @@ function ProductDetail() {
           </div>
 
           <div className="product-actions">
-            <a 
-              href={product.url} 
-              target="_blank" 
-              rel="noopener noreferrer" 
-              className="btn btn-primary"
-            >
-              Открыть на Wildberries
-            </a>
+            {product.product_url && (
+              <a 
+                href={product.product_url} 
+                target="_blank" 
+                rel="noopener noreferrer" 
+                className="btn btn-primary"
+              >
+                Открыть на Wildberries
+              </a>
+            )}
             <Link to="/products" className="btn btn-secondary">
               Назад к списку
             </Link>
@@ -125,9 +132,6 @@ function ProductDetail() {
           <div className="similar-grid">
             {similarProducts.map(similar => (
               <div key={similar.id} className="similar-card">
-                {similar.image_url && (
-                  <img src={similar.image_url} alt={similar.name} className="similar-image" />
-                )}
                 <div className="similar-info">
                   <h3>{similar.name}</h3>
                   <div className="similar-price">
@@ -152,5 +156,7 @@ function ProductDetail() {
     </div>
   );
 }
+
+ProductDetail.propTypes = {};
 
 export default ProductDetail; 

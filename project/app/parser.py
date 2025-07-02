@@ -1,12 +1,10 @@
 import requests
 import json
-import time
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 from fake_useragent import UserAgent
 from .models import Product
 from bs4 import BeautifulSoup
-import re
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
@@ -70,7 +68,9 @@ class WildberriesParser:
             # Ограничиваем количество товаров до запрошенного лимита
             if len(products) > limit:
                 products = products[:limit]
-                logger.info(f"Ограничили до {limit} товаров")
+                logger.info(
+                    f"Ограничили до {limit} товаров"
+                )
             
             return self._parse_products(products)
             
@@ -87,6 +87,59 @@ class WildberriesParser:
             logger.error(f"Неожиданная ошибка: {e}")
             return []
 
+    def parse_prices_from_html(self, product_url: str) -> Tuple[float, Optional[float]]:
+        """
+        Парсит страницу товара Wildberries и возвращает (price, discount_price).
+        Если скидки нет, discount_price = None.
+        """
+        try:
+            resp = requests.get(product_url, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, 'html.parser')
+
+            # Цена со скидкой (обычно <ins class="price__lower-price ...">)
+            discount_tag = soup.find('ins', class_='price__lower-price')
+            discount_price = None
+            if discount_tag:
+                discount_price = float(
+                    discount_tag.text.replace('\xa0', '')
+                    .replace('₽', '')
+                    .replace(' ', '')
+                    .strip()
+                )
+
+            # Обычная цена (обычно <del> или <span class="old-price">)
+            old_price_tag = soup.find('del')
+            if not old_price_tag:
+                old_price_tag = soup.find('span', class_='old-price')
+            if old_price_tag:
+                price = float(
+                    old_price_tag.text.replace('\xa0', '')
+                    .replace('₽', '')
+                    .replace(' ', '')
+                    .strip()
+                )
+            else:
+                # Если нет старой цены, ищем просто цену (без скидки)
+                price_tag = soup.find('ins', class_='price__lower-price')
+                if not price_tag:
+                    price_tag = soup.find('span', class_='price__lower-price')
+                if price_tag:
+                    price = float(
+                        price_tag.text.replace('\xa0', '')
+                        .replace('₽', '')
+                        .replace(' ', '')
+                        .strip()
+                    )
+                else:
+                    # fallback: ищем любую цену
+                    price = discount_price if discount_price is not None else 0.0
+
+            return price, discount_price
+        except Exception as e:
+            logger.error(f"Ошибка парсинга HTML цен: {e}")
+            return 0.0, None
+
     def _parse_products(self, products_data: List[Dict]) -> List[Dict]:
         """
         Парсинг данных товаров
@@ -95,36 +148,38 @@ class WildberriesParser:
         
         for product in products_data:
             try:
-                # Извлекаем данные
                 product_id = product.get('id', '')
                 name = product.get('name', '')
-                
-                # Цены
+                product_url = f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx"
+
+                # Цены из API
                 original_price = product.get('priceU', 0)  # Обычная цена
                 sale_price = product.get('salePriceU', 0)  # Цена со скидкой
-                
-                # Конвертируем копейки в рубли
                 original_price_rub = original_price / 100 if original_price else 0
                 sale_price_rub = sale_price / 100 if sale_price else 0
-                
-                # Определяем основную цену и цену со скидкой
-                if sale_price_rub > 0 and sale_price_rub < original_price_rub:
-                    # Есть скидка
-                    price = original_price_rub
-                    discount_price = sale_price_rub
+
+                # Если цены из API подозрительны — парсим HTML
+                if (original_price_rub == 0) or (
+                    sale_price_rub == 0 and original_price_rub == 0
+                ):
+                    price, discount_price = self.parse_prices_from_html(
+                        product_url
+                    )
                 else:
-                    # Нет скидки или скидка больше обычной цены
-                    price = sale_price_rub if sale_price_rub > 0 else original_price_rub
-                    discount_price = None
-                
+                    if sale_price_rub > 0 and sale_price_rub < original_price_rub:
+                        price = original_price_rub
+                        discount_price = sale_price_rub
+                    else:
+                        price = sale_price_rub if sale_price_rub > 0 else original_price_rub
+                        discount_price = None
+
                 # Рейтинг
                 rating = product.get('rating', 0)
                 
                 # Количество отзывов (feedbacks)
                 review_count = product.get('feedbacks', 0)
                 
-                # URL товара
-                product_url = f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx"
+                logger.info(f'Ключи товара: {list(product.keys())}')
                 
                 parsed_product = {
                     'product_id': str(product_id),
@@ -134,6 +189,7 @@ class WildberriesParser:
                     'rating': rating,
                     'reviews_count': review_count,
                     'product_url': product_url,
+                    'image_url': '',
                     'category': '',
                     'search_query': ''
                 }
@@ -165,6 +221,7 @@ class WildberriesParser:
                         'rating': product_data['rating'],
                         'reviews_count': product_data['reviews_count'],
                         'product_url': product_data['product_url'],
+                        'image_url': product_data['image_url'],
                         'category': product_data['category'],
                         'search_query': product_data['search_query']
                     }
@@ -177,6 +234,7 @@ class WildberriesParser:
                 product.rating = product_data['rating']
                 product.reviews_count = product_data['reviews_count']
                 product.product_url = product_data['product_url']
+                product.image_url = product_data['image_url']
                 product.category = product_data['category']
                 product.search_query = product_data['search_query']
                 product.save()
@@ -194,21 +252,25 @@ class WildberriesParser:
     def parse_and_save(self, query: str, category: str = "", limit: int = 10) -> int:
         """
         Основной метод для парсинга и сохранения товаров
-        """        
+        """
         # Парсим товары
         products = self.search_products(query, limit)
-        
+
         if not products:
             return 0
-        
+
+        # Если категория не передана, подставляем дефолтное значение
+        if not category:
+            category = "Без категории"
+
         # Добавляем поисковый запрос и категорию к каждому товару
         for product in products:
             product['search_query'] = query
             product['category'] = category
-        
+
         # Сохраняем в базу
         saved_count = self.save_products(products)
-        
+
         logger.info(f"Парсинг завершен! Сохранено товаров: {saved_count}")
         return saved_count
 

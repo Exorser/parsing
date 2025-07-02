@@ -13,8 +13,14 @@ class Product(models.Model):
     product_id = models.CharField(max_length=100, unique=True, verbose_name="ID товара")
     category = models.CharField(max_length=200, verbose_name="Категория")
     search_query = models.CharField(max_length=200, verbose_name="Поисковый запрос")
-    created_at = models.DateTimeField(default=timezone.now, verbose_name="Дата создания")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+    created_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name="Дата создания"
+    )
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name="Дата обновления"
+    )
     
     class Meta:
         verbose_name = "Товар"

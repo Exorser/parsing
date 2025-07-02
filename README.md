@@ -1,9 +1,62 @@
 # Wildberries Parser
+![Wildberries Parser](image1.png)
+## Описание
 
-![Wildberries Parser](image.png)
+Проект для парсинга товаров с Wildberries и отображения их на современном веб-интерфейсе. Бэкенд реализован на Django, фронтенд — на React.
+
+---
+
+## Backend (Django)
+- Парсинг товаров с Wildberries
+- Фильтрация, поиск, API для фронта
+- Хранение данных в базе
+
+### Запуск backend:
+```bash
+cd project
+python manage.py migrate
+python manage.py runserver
+```
+
+---
+
+## Frontend (React)
+
+Фронтенд реализован на **React** (находится в папке `frontend/`).
+
+### Основные возможности:
+- Просмотр списка товаров
+- Детальная страница товара
+- Фильтрация и поиск по товарам
+- Графики и динамическое обновление данных
+- Современный UI/UX
+
+### Структура:
+- `frontend/src/components/` — основные компоненты (ProductList, ProductDetail, SearchForm и др.)
+- `frontend/public/` — статические файлы и шаблоны
+
+### Запуск фронтенда:
+```bash
+cd frontend
+npm install
+npm start
+```
+
+Фронтенд будет доступен по адресу [http://localhost:3000](http://localhost:3000)
+
+---
+
+## Примечания
+- Картинки товаров не парсятся и не отображаются (ограничения Wildberries).
+- Для работы требуется Python 3.10+, Node.js 16+.
+
+---
+
+## Контакты
+Вопросы и предложения: issues или pull request.
 
 Парсер товаров с сайта Wildberries на Django с использованием requests + XHR запросов.
-
+![Wildberries Parser](image.png)
 ## Особенности
 
 - ⚡ **Быстрый парсинг** через XHR запросы (без браузера)

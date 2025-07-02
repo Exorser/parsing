@@ -1,28 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import axios from 'axios';
 import './SearchForm.css';
 
 function SearchForm() {
   const [searchQuery, setSearchQuery] = useState('');
   const [category, setCategory] = useState('');
-  const [categories, setCategories] = useState([]);
+  const [limit, setLimit] = useState(10);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-
-  useEffect(() => {
-    fetchCategories();
-  }, []);
-
-  const fetchCategories = async () => {
-    try {
-      const response = await axios.get('/api/products/');
-      const categories = response.data.categories || [];
-      setCategories(categories);
-    } catch (err) {
-      console.error('Ошибка загрузки категорий:', err);
-    }
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -39,12 +25,14 @@ function SearchForm() {
 
       const response = await axios.post('/api/start-parsing/', {
         search_query: searchQuery.trim(),
-        category: category || null
+        category: category || null,
+        limit: limit
       });
 
       setMessage('Парсинг запущен успешно! Товары будут добавлены в базу данных.');
       setSearchQuery('');
       setCategory('');
+      setLimit(10);
     } catch (err) {
       setError(err.response?.data?.error || 'Ошибка при запуске парсинга');
     } finally {
@@ -69,16 +57,25 @@ function SearchForm() {
             className="search-input"
             disabled={loading}
           />
-          <select
+          <input
+            type="text"
             value={category}
-            onChange={(e) => setCategory(e.target.value)}
+            onChange={e => setCategory(e.target.value)}
+            placeholder="Категория (опционально)"
+            className="search-input"
+            disabled={loading}
+            style={{ width: '200px', marginLeft: 8 }}
+          />
+          <select
+            value={limit}
+            onChange={e => setLimit(Number(e.target.value))}
             className="search-select"
             disabled={loading}
+            style={{ width: '120px', minWidth: 120, marginLeft: 8 }}
           >
-            <option value="">Все категории (опционально)</option>
-            {categories.map(cat => (
-              <option key={cat} value={cat}>{cat}</option>
-            ))}
+            <option value={10}>10</option>
+            <option value={50}>50</option>
+            <option value={100}>100</option>
           </select>
           <button 
             type="submit" 
