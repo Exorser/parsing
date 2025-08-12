@@ -46,12 +46,6 @@ npm start
 
 ---
 
-## Примечания
-- Картинки товаров не парсятся и не отображаются (ограничения Wildberries).
-- Для работы требуется Python 3.10+, Node.js 16+.
-
----
-
 ## Контакты
 Вопросы и предложения: issues или pull request.
 
@@ -178,4 +172,5 @@ http://127.0.0.1:8000/
 - PostgreSQL (рекомендуется) или SQLite
 - requests
 - fake-useragent
+
 - beautifulsoup4
