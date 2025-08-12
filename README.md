@@ -45,11 +45,6 @@ npm start
 Фронтенд будет доступен по адресу [http://localhost:3000](http://localhost:3000)
 
 ---
-
-## Контакты
-Вопросы и предложения: issues или pull request.
-
-Парсер товаров с сайта Wildberries на Django с использованием requests + XHR запросов.
 ![Wildberries Parser](image.png)
 ## Особенности
 
@@ -174,3 +169,4 @@ http://127.0.0.1:8000/
 - fake-useragent
 
 - beautifulsoup4
+
