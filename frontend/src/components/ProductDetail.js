@@ -14,6 +14,8 @@ function ProductDetail() {
   const [similarProducts, setSimilarProducts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [imageErrors, setImageErrors] = useState({});
 
   useEffect(() => {
     fetchProduct();
@@ -25,6 +27,13 @@ function ProductDetail() {
       const response = await axios.get(`/api/products/${id}/`);
       setProduct(response.data.product);
       setSimilarProducts(response.data.similar_products);
+      
+      // Устанавливаем первое изображение как выбранное по умолчанию
+      if (response.data.product.images && response.data.product.images.length > 0) {
+        setSelectedImage(response.data.product.images[0].image_url);
+      } else if (response.data.product.image_url) {
+        setSelectedImage(response.data.product.image_url);
+      }
     } catch (err) {
       setError('Товар не найден');
       console.error(err);
@@ -32,6 +41,10 @@ function ProductDetail() {
       setLoading(false);
     }
   };
+
+  const handleImageError = (url) => {
+  setImageErrors(prev => ({ ...prev, [url]: true }));
+};
 
   if (loading) {
     return <div className="loading">Загрузка товара...</div>;
@@ -54,6 +67,13 @@ function ProductDetail() {
     ? Math.round(((product.price - product.discount_price) / product.price) * 100)
     : 0;
 
+  // Получаем все изображения товара
+  const allImages = product.images && product.images.length > 0 
+    ? product.images.map(img => img.image_url) 
+    : product.image_url 
+      ? [product.image_url] 
+      : [];
+
   return (
     <div className="product-detail">
       <div className="breadcrumb">
@@ -64,8 +84,30 @@ function ProductDetail() {
 
       <div className="product-main">
         <div className="product-images">
-          {product.image_url && (
-            <img src={product.image_url} alt={product.name} className="main-image" />
+          {/* Основное изображение */}
+          {selectedImage && (
+            <div className="main-image-container">
+              <img src={selectedImage} alt={product.name} className="main-image" />
+            </div>
+          )}
+          
+          {/* Галерея миниатюр */}
+          {allImages.length > 1 && (
+            <div className="thumbnail-gallery">
+              {allImages.map((imgUrl, index) => (
+                <div 
+                  key={index} 
+                  className={`thumbnail-container ${selectedImage === imgUrl ? 'active' : ''}`}
+                  onClick={() => setSelectedImage(imgUrl)}
+                >
+                  <img 
+                    src={imgUrl} 
+                    alt={`${product.name} - фото ${index + 1}`} 
+                    className="thumbnail"
+                  />
+                </div>
+              ))}
+            </div>
           )}
         </div>
 
@@ -132,6 +174,13 @@ function ProductDetail() {
           <div className="similar-grid">
             {similarProducts.map(similar => (
               <div key={similar.id} className="similar-card">
+                {similar.image_url && (
+                  <img 
+                    src={similar.image_url} 
+                    alt={similar.name} 
+                    className="similar-image"
+                  />
+                )}
                 <div className="similar-info">
                   <h3>{similar.name}</h3>
                   <div className="similar-price">
@@ -157,6 +206,8 @@ function ProductDetail() {
   );
 }
 
-ProductDetail.propTypes = {};
+ProductDetail.propTypes = {
+  // Добавьте propTypes по необходимости
+};
 
-export default ProductDetail; 
+export default ProductDetail;
