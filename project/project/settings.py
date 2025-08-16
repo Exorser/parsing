@@ -80,9 +80,13 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": "wildberries_parser",
         "USER": "postgres",
-        "PASSWORD": "Kohkau11999",
+        "PASSWORD": "post",
         "HOST": "localhost",
-        "PORT": "5432",
+        "PORT": "5433",
+        'OPTIONS': {
+            'client_encoding': 'UTF8',
+            'options': '-c client_encoding=utf8'  # Дополнительная настройка
+        }
     }
 }
 
