@@ -1,5 +1,4 @@
 import requests
-import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Any
@@ -8,15 +7,15 @@ from bs4 import BeautifulSoup
 from io import BytesIO
 from django.core.files import File
 from urllib.parse import urlparse
-from .models import Product, ProductImage  # Импорт ваших моделей
+from .models import Product, ProductImage
 from django.core.cache import cache
 import asyncio
 import aiohttp
 from functools import lru_cache
+from PIL import Image
+import uuid
 import time
 import random
-from PIL import Image
-import uuid   
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,7 @@ class WildberriesParser:
         self.base_url = "https://www.wildberries.ru"
         self.search_url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
         self.timeout = 5
-        self.max_workers = 10 
+        self.max_workers = 10
         
         self.session.headers.update({
             'User-Agent': self.ua.random,
@@ -42,8 +41,6 @@ class WildberriesParser:
             'Pragma': 'no-cache',
             'Referer': 'https://www.wildberries.ru/'
         })
-    
-    
 
     def search_products(self, query: str, limit: int = 10) -> List[Dict]:
         """Поиск товаров через API Wildberries"""
@@ -82,242 +79,208 @@ class WildberriesParser:
         except Exception as e:
             logger.error(f"Ошибка при поиске товаров: {e}", exc_info=True)
             return []
-        
-    def _get_image_urls_from_api(self, product_id: int) -> List[str]:
-        """Альтернативный метод получения URL через API с обработкой 404"""
-        try:
-            response = self.session.get(
-                f"https://card.wb.ru/cards/detail?nm={product_id}",
-                timeout=5
-            )
-            if response.status_code == 404:
-                return []
-            data = response.json()
-            return [f"https://images.wbstatic.net/big/new/{pic}.jpg" 
-                   for pic in data.get('data', {}).get('products', [{}])[0].get('pics', [])]
-        except Exception as e:
-            logger.warning(f"Ошибка API для товара {product_id}: {str(e)}")
-            return []
-    
-    def _get_image_urls(self, product_id: int) -> List[str]:
-        """
-        Основной метод получения URL изображений.
-        Комбинирует все возможные способы получения URL.
-        """
-        try:
-            # Убедимся, что product_id - целое число
-            product_id = int(product_id)
-            vol = product_id // 100000
-            part = product_id // 1000
-            
-            # 1. Пробуем стандартные URL Wildberries
-            standard_urls = [
-                f"https://basket-01.wb.ru/vol{vol}/part{part}/{product_id}/images/big/1.webp",
-                f"https://basket-01.wb.ru/vol{vol}/part{part}/{product_id}/images/big/1.jpg",
-                f"https://images.wbstatic.net/big/new/{product_id}-1.jpg",
-                f"https://images.wbstatic.net/c516x688/new/{product_id}-1.jpg"
-            ]
-            
-            # 2. Пробуем получить через API (если не работает, просто игнорируем)
-            api_urls = []
-            try:
-                response = requests.get(
-                    f"https://card.wb.ru/cards/detail?nm={product_id}",
-                    headers={'User-Agent': self.ua.random},
-                    timeout=3
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('data', {}).get('products'):
-                        api_urls = [f"https://images.wbstatic.net/big/new/{pic}.jpg" 
-                                for pic in data['data']['products'][0].get('pics', [])]
-            except Exception as e:
-                logger.debug(f"Ошибка при запросе API для товара {product_id}: {str(e)}")
-            
-            # 3. Комбинируем все URL и убираем дубликаты
-            all_urls = list(set(standard_urls + api_urls))
-            return all_urls
-            
-        except Exception as e:
-            logger.error(f"Ошибка генерации URL для товара {product_id}: {str(e)}")
-            return []
-    
-    def _get_valid_image_urls(self, product_id: int) -> List[str]:
-        """Основной метод получения рабочих URL изображений"""
-        # 1. Пробуем получить URL через API
-        api_urls = self._get_image_urls_from_api(product_id)
-        if api_urls:
-            return api_urls[:3]  # Берем первые 3 изображения
-        
-        # 2. Если API не сработало, генерируем URL по шаблону
-        generated_urls = self._generate_image_urls(product_id)
-        
-        # 3. Проверяем сгенерированные URL (максимум 5 параллельных проверок)
-        valid_urls = []
-        with ThreadPoolExecutor(max_workers=min(5, self.max_workers)) as executor:
-            future_to_url = {
-                executor.submit(self._check_image_available, url): url
-                for url in generated_urls[:20]  # Проверяем только первые 20 URL
-            }
-            
-            for future in as_completed(future_to_url):
-                if future.result():
-                    valid_urls.append(future_to_url[future])
-                    if len(valid_urls) >= 3:  # Нам достаточно 3 рабочих URL
-                        break
-        
-        return valid_urls
-    
-    @lru_cache(maxsize=1000)
-    def _get_product_image_urls(self, product_id: int) -> List[str]:
-        """Генерация URL изображений с кэшированием"""
-        urls = []
-        product_id = int(product_id)
-        vol = product_id // 100000
-        part = product_id // 1000
-        
-        # Основные шаблоны URL
-        templates = [
-            f"https://basket-{{server:02d}}.wb.ru/vol{vol}/part{part}/{product_id}/images/{{size}}/{{num}}.webp",
-            f"https://basket-{{server:02d}}.wb.ru/vol{vol}/part{part}/{product_id}/images/{{size}}/{{num}}.jpg",
-            f"https://images.wbstatic.net/{{size}}/new/{product_id}-{{num}}.jpg"
-        ]
-        
-        sizes = ['big', 'c516x688']
-        servers = [1]  # Используем только basket-01 (самый надежный)
-        
-        for template in templates:
-            for server in servers:
-                for size in sizes:
-                    for num in range(1, 6):  # Проверяем только первые 5 изображений
-                        url = template.format(server=server, size=size, num=num)
-                        urls.append(url)
-        
-        return list(set(urls))  # Удаляем дубликаты
 
-    
-    def _get_product_data_from_api(self, product_id: int) -> Optional[Dict]:
-        """Получает данные товара через официальное API Wildberries"""
+    def _get_image_urls_from_api(self, product_id: int) -> List[str]:
+        """Получение URL изображений через API с проверкой доступности"""
         try:
             response = requests.get(
                 f"https://card.wb.ru/cards/detail?nm={product_id}",
                 headers={'User-Agent': self.ua.random},
                 timeout=5
             )
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get('data', {}).get('products'):
-                return data['data']['products'][0]
-        except Exception as e:
-            logger.warning(f"Ошибка API для товара {product_id}: {e}")
-        return None
-
-    def _download_image_with_retry(self, url: str, retries: int = 2) -> Optional[BytesIO]:
-        """Загрузка изображения с повторными попытками"""
-        for attempt in range(retries + 1):
-            try:
-                response = requests.get(
-                    url,
-                    stream=True,
-                    timeout=(3.05, 6),  # Connect timeout 3s, read timeout 6s
-                    headers={'User-Agent': self.ua.random}
-                )
-                response.raise_for_status()
-                return BytesIO(response.content)
-            except Exception as e:
-                if attempt == retries:
-                    logger.warning(f"Не удалось загрузить изображение {url} после {retries} попыток: {str(e)}")
-                    return None
-                logger.debug(f"Повторная попытка ({attempt + 1}/{retries}) для {url}")
-                time.sleep(0.5 * (attempt + 1))  # Постепенное увеличение задержки
-        
-    def _process_product_images(self, product: Product) -> List[ProductImage]:
-        """Обработка изображений товара"""
-        valid_urls = self._get_valid_image_urls(product.product_id)
-        saved_images = []
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self._download_image, product, url)
-                for url in valid_urls[:5]  # Ограничиваем количество загрузок
-            ]
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result:
-                        saved_images.append(result)
-                except Exception as e:
-                    logger.warning(f"Ошибка при обработке изображения: {e}")
-        
-        return saved_images
-
-    def _check_image_available(self, url: str) -> bool:
-        """Проверка доступности изображения с улучшенной обработкой ошибок"""
-        try:
-            # Меняем User-Agent для каждого запроса
-            headers = {'User-Agent': self.ua.random}
-            
-            # Делаем HEAD-запрос (быстрее, чем GET)
-            response = requests.head(url, headers=headers, timeout=3, allow_redirects=True)
-            
-            # Проверяем статус код и content-type
             if response.status_code != 200:
-                return False
+                return []
                 
-            content_type = response.headers.get('Content-Type', '')
-            if not content_type.startswith('image/'):
-                return False
+            data = response.json()
+            products = data.get('data', {}).get('products', [])
+            if not products:
+                return []
                 
-            return True
+            # Получаем все доступные изображения
+            pics = products[0].get('pics', [])
+            return [f"https://images.wbstatic.net/big/new/{pic}.jpg" for pic in pics]
+            
         except Exception as e:
-            logger.debug(f"Изображение недоступно {url}: {str(e)}")
-            return False
-    
-    
+            logger.warning(f"Ошибка API для товара {product_id}: {str(e)}")
+            return []
 
+    @lru_cache(maxsize=1000)
     def _generate_image_urls(self, product_id: int) -> List[str]:
-        """Генерация возможных URL изображений с учетом разных серверов"""
+        """Генерация URL с приоритетом разных серверов и форматов"""
         product_id = int(product_id)
-        urls = []
-        
-        # Вычисляем vol и part
+        urls = set()
         vol = product_id // 100000
         part = product_id // 1000
+
+        # Основные серверы (1-40) + приоритетные
+        servers = list(range(1, 41)) + [3, 5, 7, 10, 15, 20, 25, 30]
         
-        # 1. Основной шаблон Wildberries (пробуем разные серверы basket-01..basket-26)
-        servers = range(1, 27)  # Серверы от basket-01 до basket-26
-        base_url_template = "https://basket-{server:02d}.wbbasket.ru/vol{vol}/part{part}/{product_id}/images"
+        # Альтернативные домены
+        domains = ['wbbasket.ru', 'wb.ru']
         
-        for server in servers:
-            base_url = base_url_template.format(server=server, vol=vol, part=part, product_id=product_id)
-            for size in ['big', 'c516x688']:  # Разные размеры изображений
-                for i in range(1, 6):  # Первые 5 изображений каждого типа
-                    urls.extend([
-                        f"{base_url}/{size}/{i}.webp",
-                        f"{base_url}/{size}/{i}.jpg"
-                    ])
-        
-        # 2. Альтернативные URL (wbstatic.net)
-        urls.extend([
+        for domain in domains:
+            for server in servers:
+                base_url = f"https://basket-{server:02d}.{domain}/vol{vol}/part{part}/{product_id}/images"
+                urls.update({
+                    f"{base_url}/big/1.webp",
+                    f"{base_url}/big/1.jpg",
+                    f"{base_url}/big/2.webp",
+                    f"{base_url}/big/2.jpg",
+                    f"{base_url}/c516x688/1.webp",
+                    f"{base_url}/c516x688/1.jpg"
+                })
+
+        # Добавляем URL из API Wildberries
+        api_urls = self._get_image_urls_from_api(product_id)
+        urls.update(api_urls)
+
+        # Специальные форматы WB
+        urls.update({
             f"https://images.wbstatic.net/big/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/c516x688/new/{product_id}-1.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-2.jpg",
-        ])
+            f"https://images.wbstatic.net/c516x688/new/{product_id}-1.jpg",
+            f"https://images.wbstatic.net/c516x688/new/{product_id}-2.jpg",
+            f"https://images.wbstatic.net/big/new/{product_id}-1.webp"
+        })
+
+        return list(urls)
+
+    async def _check_url_available(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        """Проверка доступности URL с обработкой DNS ошибок"""
+        try:
+            async with session.head(url, allow_redirects=True, 
+                                timeout=aiohttp.ClientTimeout(total=3)) as response:
+                if response.status == 200:
+                    content_type = response.headers.get('Content-Type', '')
+                    if content_type.startswith('image/'):
+                        return str(response.url)
+        except aiohttp.ClientConnectorError as e:
+            logger.debug(f"Ошибка подключения к {url}: {str(e)}")
+        except asyncio.TimeoutError:
+            logger.debug(f"Таймаут при проверке {url}")
+        except Exception as e:
+            logger.debug(f"Ошибка проверки URL {url}: {str(e)}")
+        return None
+
+    async def _get_valid_image_urls_async(self, product_id: int) -> List[str]:
+        """Улучшенный поиск рабочих URL"""
+        urls = self._generate_image_urls(product_id)
+        valid_urls = []
         
-        return list(set(urls))  # Удаляем дубликаты
+        # Разделяем URL по приоритетам
+        high_priority = [url for url in urls if any(p in url for p in [
+            'basket-01', 'basket-02', 'basket-03', 'wbstatic.net/big'
+        ])]
+        
+        mid_priority = [url for url in urls if any(p in url for p in [
+            'basket-04', 'basket-05', 'c516x688'
+        ]) and url not in high_priority]
+        
+        low_priority = [url for url in urls if url not in high_priority + mid_priority]
+        
+        async with aiohttp.ClientSession(headers={
+            'User-Agent': self.ua.random,
+            'Referer': 'https://www.wildberries.ru/'
+        }) as session:
+            # Проверяем по приоритетам
+            for url_group in [high_priority, mid_priority, low_priority]:
+                tasks = [self._check_url_available(session, url) for url in url_group[:30]]  # Проверяем до 30 URL из каждой группы
+                results = await asyncio.gather(*tasks)
+                
+                for result in results:
+                    if result and result not in valid_urls:
+                        valid_urls.append(result)
+                        if len(valid_urls) >= 5:  # Находим до 5 рабочих URL
+                            return valid_urls
+        
+        return valid_urls
     
-    
+    def _get_valid_image_urls(self, product_id: int) -> List[str]:
+        """Синхронная обертка для асинхронного метода"""
+        return asyncio.run(self._get_valid_image_urls_async(product_id))
+
+    def _download_image_fast(self, url: str) -> Optional[BytesIO]:
+        """Улучшенная загрузка изображения с обработкой ошибок DNS"""
+        try:
+            headers = {
+                'User-Agent': self.ua.random,
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                'Referer': 'https://www.wildberries.ru/',
+            }
+            
+            # Уменьшаем таймаут для DNS
+            response = requests.get(url, headers=headers, 
+                                stream=True, timeout=(3.05, 10))
+            response.raise_for_status()
+            
+            if not response.headers.get('Content-Type', '').startswith('image/'):
+                return None
+                
+            img_data = BytesIO()
+            for chunk in response.iter_content(chunk_size=8192):
+                img_data.write(chunk)
+                
+            img_data.seek(0)
+            
+            try:
+                img = Image.open(img_data)
+                img.verify()
+                img_data.seek(0)
+                return img_data
+            except:
+                return None
+                
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"Ошибка подключения к {url}: {str(e)}")
+            return None
+        except requests.exceptions.Timeout:
+            logger.debug(f"Таймаут при загрузке {url}")
+            return None
+        except Exception as e:
+            logger.debug(f"Ошибка загрузки изображения {url}: {str(e)}")
+            return None
+
+    def _process_product_images_fast(self, product: Product) -> bool:
+        """Быстрая обработка изображений с резервными вариантами"""
+        valid_urls = self._get_valid_image_urls(product.product_id)
+        logger.info(f"Найдено {len(valid_urls)} валидных URL для товара {product.product_id}")
+        
+        if not valid_urls:
+            logger.warning(f"Не найдено рабочих URL изображений для товара {product.product_id}")
+            return False
+            
+        for i, url in enumerate(valid_urls[:5]):  # Пробуем первые 5 URL
+            try:
+                # Добавляем небольшую задержку между запросами
+                if i > 0:
+                    time.sleep(0.5)
+                    
+                img_data = self._download_image_fast(url)
+                if not img_data:
+                    continue
+                    
+                file_ext = 'jpg' if '.jpg' in url.lower() else 'webp'
+                img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:6]}.{file_ext}"
+                
+                product_image = ProductImage(product=product, image_url=url)
+                product_image.image.save(img_name, File(img_data), save=True)
+                
+                # Обновляем основное изображение товара, если это первое изображение
+                if i == 0:
+                    product.image_url = url
+                    product.save()
+                    
+                return True
+                
+            except Exception as e:
+                logger.error(f"Ошибка сохранения изображения {url}: {str(e)}", exc_info=True)
+        
+        return False
 
     def _extract_price_info(self, product: Dict) -> Dict[str, Optional[float]]:
-        """
-        Улучшенное извлечение информации о ценах с учетом всех возможных вариантов от Wildberries
-        """
-        # Основные варианты получения цен
-        price = discount_price = None
+        """Извлекает информацию о ценах товара"""
+        price = discount_price = wildberries_card_price = None
         
-        # 1. Проверяем новый формат цен (через sizes)
         if 'sizes' in product and product['sizes']:
             for size in product['sizes']:
                 if 'price' in size:
@@ -325,15 +288,15 @@ class WildberriesParser:
                     basic = price_data.get('basic', 0) / 100
                     product_price = price_data.get('product', 0) / 100
                     
-                    # Если есть скидка
                     if product_price > 0 and product_price < basic:
                         price = basic
                         discount_price = product_price
+                        wildberries_card_price = round(product_price * 0.9, 2)
                         break
                     else:
                         price = basic if basic > 0 else product_price
+                        wildberries_card_price = round(price * 0.9, 2)
         
-        # 2. Проверяем старый формат (priceU/salePriceU)
         if price is None:
             original = product.get('priceU', 0) / 100
             sale = product.get('salePriceU', 0) / 100
@@ -341,29 +304,31 @@ class WildberriesParser:
             if sale > 0 and sale < original:
                 price = original
                 discount_price = sale
+                wildberries_card_price = round(sale * 0.9, 2)
             else:
                 price = original if original > 0 else sale
+                wildberries_card_price = round(price * 0.9, 2)
         
-        # 3. Проверяем дополнительные поля (extended)
         if 'extended' in product and 'basicPriceU' in product['extended']:
             basic_ext = product['extended']['basicPriceU'] / 100
             if price is None or (basic_ext > 0 and basic_ext < price):
                 price = basic_ext
+                wildberries_card_price = round(price * 0.9, 2)
         
-        # 4. Проверяем clientSale (дополнительная скидка)
         if 'clientSale' in product and discount_price:
             client_sale = product['clientSale']
             if client_sale > 0:
                 discount_price = round(discount_price * (1 - client_sale / 100), 2)
+                wildberries_card_price = round(discount_price * 0.9, 2)
         
         return {
             'price': price if price else 0.0,
-            'discount_price': discount_price if discount_price and discount_price < price else None
+            'discount_price': discount_price if discount_price and discount_price < price else None,
+            'wildberries_card_price': wildberries_card_price if wildberries_card_price else None
         }
-    
 
     def _parse_products(self, products_data: List[Dict]) -> List[Dict]:
-        """Парсинг данных товаров с улучшенной обработкой рейтингов"""
+        """Парсинг данных товаров"""
         parsed_products = []
         
         for product in products_data:
@@ -372,20 +337,17 @@ class WildberriesParser:
                 if not product_id:
                     continue
                     
-                # Обработка рейтинга
                 rating = product.get('rating', 0)
                 if isinstance(rating, dict):
-                    rating = rating.get('rate', 0)  # Новый формат рейтинга
+                    rating = rating.get('rate', 0)
                 
-                # Обработка количества отзывов
                 reviews = product.get('feedbacks', 0)
                 if isinstance(reviews, dict):
-                    reviews = reviews.get('count', 0)  # Новый формат отзывов
+                    reviews = reviews.get('count', 0)
                 
-                image_urls = self._get_product_image_urls(int(product_id))
+                image_urls = self._generate_image_urls(int(product_id))
                 first_image = image_urls[0] if image_urls else ""
                 
-                # Формируем данные товара
                 parsed_product = {
                     'product_id': str(product_id),
                     'name': product.get('name', ''),
@@ -393,8 +355,8 @@ class WildberriesParser:
                     'rating': float(rating) if rating else 0.0,
                     'reviews_count': int(reviews) if reviews else 0,
                     'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
-                    'image_url': first_image,  # Первое изображение для основного поля
-                    'image_urls': image_urls,  # Все URL изображений
+                    'image_url': first_image,
+                    'image_urls': image_urls,
                     'category': '',
                     'search_query': ''
                 }
@@ -403,7 +365,6 @@ class WildberriesParser:
                 
             except Exception as e:
                 logger.error(f"Ошибка парсинга товара {product.get('id', 'unknown')}: {str(e)}")
-                continue
         
         return parsed_products
 
@@ -420,19 +381,18 @@ class WildberriesParser:
                         'name': product_data['name'],
                         'price': product_data['price'],
                         'discount_price': product_data['discount_price'],
+                        'wildberries_card_price': product_data['wildberries_card_price'],
                         'rating': product_data['rating'],
                         'reviews_count': product_data['reviews_count'],
                         'product_url': product_data['product_url'],
                         'category': product_data['category'],
                         'search_query': product_data['search_query'],
-                        'image_url': ''  # Временно пустое значение
+                        'image_url': product_data['image_url']
                     }
                 )
                 
                 # Пробуем сохранить изображения
-                has_images = self._save_product_images(product)
-                
-                if has_images:
+                if self._process_product_images_fast(product):
                     saved_count += 1
                     logger.info(f"Успешно сохранен товар {product.product_id} с изображениями")
                 else:
@@ -442,7 +402,7 @@ class WildberriesParser:
                 logger.error(f"Критическая ошибка сохранения товара {product_data.get('product_id')}: {str(e)}")
                 
         return saved_count
-    
+
     def calculate_price_statistics(self, products: List[Product]) -> Dict:
         """Расчет статистики по ценам для инфографики"""
         prices = [p.price for p in products if p.price]
@@ -486,121 +446,6 @@ class WildberriesParser:
         
         return distribution
 
-    def _save_product_images(self, product: Product) -> bool:
-        """
-        Улучшенное сохранение изображений товара.
-        Возвращает True, если сохранено хотя бы одно изображение.
-        """
-        # Получаем URL изображений (с проверкой доступности)
-        image_urls = self._get_valid_image_urls(product.product_id)
-        saved_count = 0
-        
-        for i, url in enumerate(image_urls[:3]):  # Ограничиваем количество попыток
-            try:
-                # Проверяем, не существует ли уже такое изображение
-                if ProductImage.objects.filter(product=product, image_url=url).exists():
-                    continue
-                    
-                # Добавляем задержку между запросами (1-3 секунды)
-                if i > 0:
-                    time.sleep(random.uniform(1, 3))
-                
-                # Загружаем изображение
-                img_data = self._download_image_with_retry(url)
-                if not img_data:
-                    continue
-                    
-                # Генерируем уникальное имя файла
-                img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:8]}.jpg"
-                
-                # Сохраняем изображение
-                product_image = ProductImage(
-                    product=product,
-                    image_url=url
-                )
-                product_image.image.save(img_name, File(img_data), save=True)
-                saved_count += 1
-                
-                # Если это первое изображение - обновляем основное изображение товара
-                if saved_count == 1:
-                    product.image_url = url
-                    product.save()
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка сохранения изображения {url}: {str(e)}")
-                continue
-                
-        return saved_count > 0
-
-    def _download_image_with_retry(self, url: str, retries: int = 3) -> Optional[BytesIO]:
-        """Загрузка изображения с повторными попытками и обработкой ошибок"""
-        for attempt in range(retries):
-            try:
-                # Используем случайный User-Agent для каждого запроса
-                headers = {
-                    'User-Agent': self.ua.random,
-                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                    'Referer': 'https://www.wildberries.ru/'
-                }
-                
-                # Устанавливаем разумные таймауты
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    stream=True,
-                    timeout=(3.05, 10)  # 3s connect timeout, 10s read timeout
-                )
-                
-                # Проверяем статус код и content-type
-                if response.status_code != 200:
-                    raise ValueError(f"HTTP {response.status_code}")
-                    
-                if not response.headers.get('Content-Type', '').startswith('image/'):
-                    raise ValueError("Invalid content type")
-                    
-                # Читаем содержимое в BytesIO
-                img_data = BytesIO()
-                for chunk in response.iter_content(chunk_size=8192):
-                    img_data.write(chunk)
-                    
-                # Проверяем, что это валидное изображение
-                img_data.seek(0)
-                Image.open(img_data).verify()  # Проверка целостности изображения
-                img_data.seek(0)
-                
-                return img_data
-                
-            except Exception as e:
-                if attempt == retries - 1:
-                    logger.warning(f"Не удалось загрузить изображение {url} после {retries} попыток: {str(e)}")
-                    return None
-                time.sleep(1 * (attempt + 1))  # Постепенно увеличиваем задержку
-                    
-            except Exception as e:
-                    if attempt == retries - 1:
-                        logger.warning(f"Не удалось загрузить изображение {url} после {retries} попыток: {str(e)}")
-                        return None
-                    time.sleep(1 * (attempt + 1))  # Постепенно увеличиваем задержку
-    
-    def _save_image(self, product: Product, url: str) -> Optional[ProductImage]:
-        """Скачивание и сохранение изображения"""
-        try:
-            response = self.session.get(url, stream=True, timeout=10)
-            response.raise_for_status()
-            
-            img_name = f"{product.product_id}_{url.split('/')[-1]}"
-            img_file = BytesIO(response.content)
-            
-            product_image = ProductImage(
-                product=product,
-                image_url=url
-            )
-            product_image.image.save(img_name, File(img_file), save=True)
-            return product_image
-        except Exception as e:
-            logger.warning(f"Ошибка сохранения изображения {url}: {e}")
-            return None
-        
     def parse_and_save(self, query: str, category: str = "", limit: int = 10) -> int:
         """Основной метод для парсинга и сохранения"""
         products = self.search_products(query, limit)

@@ -136,7 +136,6 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# Logging configuration
 
 # Создаем папку для логов если её нет
 LOGS_DIR = BASE_DIR / 'logs'
