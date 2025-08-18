@@ -56,6 +56,8 @@ class ProductImage(models.Model):
     image = models.ImageField(upload_to='products/', verbose_name="Изображение")
     image_url = models.URLField(max_length=1000, verbose_name="URL изображения")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    image_size = models.CharField(max_length=20, blank=True, null=True)  # Новое поле
+    image_type = models.CharField(max_length=10, blank=True, null=True)   # Новое поле
 
     class Meta:
         verbose_name = "Изображение товара"
