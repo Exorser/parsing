@@ -8,10 +8,11 @@ from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.viewsets import ViewSet
 from rest_framework.decorators import action
+from rest_framework.views import APIView
 import json
 import os
 
-from .models import Product
+from .models import Product, ProductImage
 from .parser import WildberriesParser
 from .serializers import ProductSerializer
 
@@ -382,3 +383,41 @@ def start_parsing(request):
         return JsonResponse({'error': 'Неверный JSON'}, status=400)
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
+    
+class ProductDetailAPIView(APIView):
+    def get(self, request, product_id):
+        try:
+            product = Product.objects.prefetch_related('images').get(product_id=product_id)
+            similar_products = Product.objects.filter(
+                category=product.category
+            ).exclude(
+                product_id=product_id
+            ).order_by('?')[:6]  # 6 случайных товаров из той же категории
+            
+            # Формируем данные для галереи
+            images = product.images.all()
+            main_image = product.image_url
+            if images.exists():
+                gallery_images = [{
+                    'url': img.image_url,
+                    'is_main': img.is_main,
+                    'size': img.image_size,
+                    'type': img.image_type
+                } for img in images]
+            else:
+                gallery_images = [{'url': main_image, 'is_main': True}] if main_image else []
+            
+            data = {
+                'product': ProductSerializer(product).data,
+                'similar_products': ProductSerializer(similar_products, many=True).data,
+                'gallery': {
+                    'main_image': main_image,
+                    'images': gallery_images
+                }
+            }
+            return Response(data)
+        except Product.DoesNotExist:
+            return Response(
+                {'error': 'Product not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )

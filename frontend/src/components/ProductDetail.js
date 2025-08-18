@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import axios from 'axios';
 import './ProductDetail.css';
-import PropTypes from 'prop-types';
+import ProductGallery from './ProductGallery';
 
 /**
  * Детальная страница товара Wildberries
@@ -14,37 +14,35 @@ function ProductDetail() {
   const [similarProducts, setSimilarProducts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [selectedImage, setSelectedImage] = useState(null);
-  const [imageErrors, setImageErrors] = useState({});
 
   useEffect(() => {
+    const fetchProduct = async () => {
+      try {
+        setLoading(true);
+        const response = await axios.get(`/api/products/${id}/`);
+        const productData = response.data.product;
+        
+        // Формируем данные для галереи
+        const galleryImages = productData.images || [];
+        const mainImage = productData.image_url;
+        
+        setProduct({
+          ...productData,
+          galleryImages,
+          mainImage
+        });
+        
+        setSimilarProducts(response.data.similar_products || []);
+      } catch (err) {
+        setError('Товар не найден');
+        console.error('Ошибка загрузки товара:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
     fetchProduct();
   }, [id]);
-
-  const fetchProduct = async () => {
-    try {
-      setLoading(true);
-      const response = await axios.get(`/api/products/${id}/`);
-      setProduct(response.data.product);
-      setSimilarProducts(response.data.similar_products);
-      
-      // Устанавливаем первое изображение как выбранное по умолчанию
-      if (response.data.product.images && response.data.product.images.length > 0) {
-        setSelectedImage(response.data.product.images[0].image_url);
-      } else if (response.data.product.image_url) {
-        setSelectedImage(response.data.product.image_url);
-      }
-    } catch (err) {
-      setError('Товар не найден');
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleImageError = (url) => {
-  setImageErrors(prev => ({ ...prev, [url]: true }));
-};
 
   if (loading) {
     return <div className="loading">Загрузка товара...</div>;
@@ -59,20 +57,9 @@ function ProductDetail() {
     );
   }
 
-  const actualPrice = product.discount_price && product.discount_price < product.price 
-    ? product.discount_price 
-    : product.price;
-
   const discountPercent = product.discount_price && product.discount_price < product.price
     ? Math.round(((product.price - product.discount_price) / product.price) * 100)
     : 0;
-
-  // Получаем все изображения товара
-  const allImages = product.images && product.images.length > 0 
-    ? product.images.map(img => img.image_url) 
-    : product.image_url 
-      ? [product.image_url] 
-      : [];
 
   return (
     <div className="product-detail">
@@ -83,37 +70,12 @@ function ProductDetail() {
       </div>
 
       <div className="product-main">
-        <div className="product-images">
-          {/* Основное изображение */}
-          {selectedImage && (
-            <div className="main-image-container">
-              <img src={selectedImage} alt={product.name} className="main-image" />
-            </div>
-          )}
-          
-          {/* Галерея миниатюр */}
-          {allImages.length > 1 && (
-            <div className="thumbnail-gallery">
-              {allImages.map((imgUrl, index) => (
-                <div 
-                  key={index} 
-                  className={`thumbnail-container ${selectedImage === imgUrl ? 'active' : ''}`}
-                  onClick={() => setSelectedImage(imgUrl)}
-                >
-                  <img 
-                    src={imgUrl} 
-                    alt={`${product.name} - фото ${index + 1}`} 
-                    className="thumbnail"
-                  />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
+        <ProductGallery 
+          images={product.galleryImages} 
+          mainImage={product.mainImage} 
+        /> 
         <div className="product-info">
           <h1 className="product-title">{product.name}</h1>
-          
           <div className="product-price-section">
             {product.discount_price && product.discount_price < product.price ? (
               <div className="price-with-discount">
@@ -205,9 +167,5 @@ function ProductDetail() {
     </div>
   );
 }
-
-ProductDetail.propTypes = {
-  // Добавьте propTypes по необходимости
-};
 
 export default ProductDetail;

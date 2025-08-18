@@ -15,7 +15,7 @@ from functools import lru_cache
 from PIL import Image
 import uuid
 import time
-import random
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,10 @@ class WildberriesParser:
         self.search_url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
         self.timeout = 5
         self.max_workers = 10
+        self.image_limits = {
+            'check_urls': 50,  # Максимум URL для проверки
+            'download': 10     # Максимум изображений для загрузки
+        }
         
         self.session.headers.update({
             'User-Agent': self.ua.random,
@@ -43,23 +47,24 @@ class WildberriesParser:
         })
 
     def search_products(self, query: str, limit: int = 10) -> List[Dict]:
-        """Поиск товаров через API Wildberries"""
+        """Поиск разнообразных товаров (разные цены, рейтинги)"""
         try:
             params = {
                 "query": query,
                 "resultset": "catalog",
-                "limit": limit,
-                "sort": "popular",
+                "limit": limit * 2,  # Берем больше, чтобы выбрать разнообразные
+                "sort": "popular",    # Популярные товары
                 "dest": -1257786,
                 "regions": "80,64,38,4,115,83,33,68,70,69,30,86,75,40,1,66,48,110,31,22,71,114",
                 "spp": 30,
                 "curr": "rub",
                 "lang": "ru",
                 "locale": "ru",
-                "appType": 1
+                "appType": 1,
+                "feedbacksCount": 50  # Минимум 5 отзывов
             }
             
-            logger.info(f"Поиск товаров: {query}")
+            logger.info(f"Поиск разнообразных товаров: {query}")
             response = self.session.get(
                 "https://search.wb.ru/exactmatch/ru/common/v5/search",
                 params=params,
@@ -73,40 +78,70 @@ class WildberriesParser:
             elif 'products' in data:
                 products = data['products']
             
-            logger.info(f"API вернул {len(products)} товаров, запрошено: {limit}")
-            return self._parse_products(products[:limit])
-           
+            if not products:
+                return []
+            
+            # Разделяем товары на группы по рейтингу
+            high_rated = [p for p in products if p.get('rating', 0) >= 4.5]
+            medium_rated = [p for p in products if 4.0 <= p.get('rating', 0) < 4.5]
+            low_rated = [p for p in products if p.get('rating', 0) < 4.0]
+            
+            # Разделяем товары на группы по цене
+            min_price = min(p.get('salePriceU', p.get('priceU', 0)) for p in products)
+            max_price = max(p.get('salePriceU', p.get('priceU', 0)) for p in products)
+            price_step = (max_price - min_price) / 3
+            
+            cheap = [p for p in products if p.get('salePriceU', p.get('priceU', 0)) < min_price + price_step]
+            medium = [p for p in products if min_price + price_step <= p.get('salePriceU', p.get('priceU', 0)) < min_price + 2*price_step]
+            expensive = [p for p in products if p.get('salePriceU', p.get('priceU', 0)) >= min_price + 2*price_step]
+            
+            # Выбираем товары из разных групп
+            result = []
+            groups = [
+                high_rated, medium_rated, low_rated,
+                cheap, medium, expensive
+            ]
+            
+            # Распределяем товары из разных групп
+            while len(result) < limit and any(groups):
+                for group in groups:
+                    if group and len(result) < limit:
+                        result.append(group.pop(0))
+            
+            logger.info(f"Отобрано {len(result)} разнообразных товаров")
+            return self._parse_products(result[:limit])
+        
         except Exception as e:
-            logger.error(f"Ошибка при поиске товаров: {e}", exc_info=True)
+            logger.error(f"Ошибка при поиске разнообразных товаров: {e}", exc_info=True)
             return []
 
     def _get_image_urls_from_api(self, product_id: int) -> List[str]:
-            """Получение URL изображений через API с проверкой доступности"""
-            try:
-                response = requests.get(
-                    f"https://card.wb.ru/cards/detail?nm={product_id}",
-                    headers={'User-Agent': self.ua.random},
-                    timeout=5
-                )
-                if response.status_code != 200:
-                    return []
-                    
-                data = response.json()
-                products = data.get('data', {}).get('products', [])
-                if not products:
-                    return []
-                    
-                # Получаем все доступные изображения
-                pics = products[0].get('pics', [])
-                return [f"https://images.wbstatic.net/big/new/{pic}.jpg" for pic in pics]
-                
-            except Exception as e:
-                logger.warning(f"Ошибка API для товара {product_id}: {str(e)}")
+        """Получение URL изображений через API с проверкой доступности"""
+        try:
+            response = requests.get(
+                f"https://card.wb.ru/cards/detail?nm={product_id}",
+                headers={'User-Agent': self.ua.random},
+                timeout=5
+            )
+            if response.status_code != 200:
                 return []
+                
+            data = response.json()
+            products = data.get('data', {}).get('products', [])
+            if not products:
+                return []
+                
+            # Получаем только большие изображения
+            pics = products[0].get('pics', [])
+            return [f"https://images.wbstatic.net/big/new/{pic}.jpg" for pic in pics]
+            
+        except Exception as e:
+            logger.warning(f"Ошибка API для товара {product_id}: {str(e)}")
+            return []
 
     @lru_cache(maxsize=1000)
     def _generate_all_image_urls(self, product_id: int) -> List[str]:
-        """Генерация всех возможных URL изображений Wildberries"""
+        """Генерация только больших URL изображений Wildberries"""
         product_id = int(product_id)
         urls = set()
         vol = product_id // 100000
@@ -118,11 +153,8 @@ class WildberriesParser:
         # Альтернативные домены
         domains = ['wbbasket.ru', 'wb.ru', 'wildberries.ru']
         
-        # Форматы и размеры изображений
-        formats = [
-            'big', 'c516x688', 'c246x328', 'c516x688_1', 'c246x328_1',
-            'tm', 'small', 'medium', 'large', 'xlarge', 'original'
-        ]
+        # Только большие форматы изображений
+        formats = ['big', 'c516x688', 'original']
         
         # Генерация всех возможных комбинаций URL
         for domain in domains:
@@ -130,44 +162,30 @@ class WildberriesParser:
                 base_url = f"https://basket-{server:02d}.{domain}/vol{vol}/part{part}/{product_id}/images"
                 
                 for img_format in formats:
-                    for img_num in range(1, 11):  # До 10 изображений на товар
+                    for img_num in range(1, 2):  # До 10 изображений на товар
                         urls.update({
                             f"{base_url}/{img_format}/{img_num}.webp",
                             f"{base_url}/{img_format}/{img_num}.jpg",
-                            f"{base_url}/{img_format}/{img_num}.png",
-                            f"{base_url}/{img_format}/{img_num}.jpeg"
                         })
 
-        # Добавляем URL из API Wildberries
+        # Добавляем только большие URL из API Wildberries
         api_urls = self._get_image_urls_from_api(product_id)
         urls.update(api_urls)
 
-        # Специальные форматы WB
+        # Только большие форматы WB
         urls.update({
             f"https://images.wbstatic.net/big/new/{product_id}-1.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-2.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-3.jpg",
             f"https://images.wbstatic.net/c516x688/new/{product_id}-1.jpg",
             f"https://images.wbstatic.net/c516x688/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/c246x328/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/c246x328/new/{product_id}-2.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-1.webp",
             f"https://images.wbstatic.net/big/new/{product_id}-2.webp",
-            f"https://images.wbstatic.net/tm/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/tm/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/small/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/small/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/medium/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/medium/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/large/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/large/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/xlarge/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/xlarge/new/{product_id}-2.jpg",
             f"https://images.wbstatic.net/original/new/{product_id}-1.jpg",
             f"https://images.wbstatic.net/original/new/{product_id}-2.jpg"
         })
 
-        # CDN URL
+        # CDN URL только большие
         urls.update({
             f"https://cdn.wbstatic.net/big/new/{product_id}-1.jpg",
             f"https://cdn.wbstatic.net/big/new/{product_id}-2.jpg",
@@ -208,14 +226,23 @@ class WildberriesParser:
                 for result in results:
                     if result:
                         url, content_type = result
-                        valid_urls.append({
-                            'url': url,
-                            'type': content_type.split('/')[-1].split(';')[0],
-                            'size': self._get_size_from_url(url)
-                        })
+                        # Пропускаем видео и маленькие изображения
+                        if 'video' not in content_type.lower():
+                            valid_urls.append({
+                                'url': url,
+                                'type': content_type.split('/')[-1].split(';')[0],
+                                'size': self._get_size_from_url(url)
+                            })
                 
                 # Небольшая задержка между группами
                 await asyncio.sleep(0.1)
+        
+        # Сортируем по размеру (big первыми)
+        valid_urls.sort(key=lambda x: (
+            0 if 'big' in x['url'] or 'original' in x['url'] else 
+            1 if 'c516x688' in x['url'] else 
+            2
+        ))
         
         return valid_urls
     
@@ -223,14 +250,8 @@ class WildberriesParser:
         """Определение размера изображения из URL"""
         if 'c516x688' in url:
             return '516x688'
-        elif 'c246x328' in url:
-            return '246x328'
-        elif 'big' in url or 'large' in url or 'xlarge' in url or 'original' in url:
+        elif 'big' in url or 'original' in url:
             return 'big'
-        elif 'medium' in url:
-            return 'medium'
-        elif 'small' in url or 'tm' in url:
-            return 'small'
         return 'unknown'
     
     def get_all_image_urls(self, product_id: int) -> List[Dict[str, str]]:
@@ -278,7 +299,7 @@ class WildberriesParser:
         image_urls = self.get_all_image_urls(product_id)
         downloaded_images = []
         
-        for img_info in image_urls:
+        for img_info in image_urls[:self.image_limits['download']]:  # Ограничиваем количество загружаемых изображений
             url = img_info['url']
             result = self._download_image(url)
             
@@ -293,7 +314,7 @@ class WildberriesParser:
                 logger.info(f"Успешно загружено изображение {url}")
             
             # Небольшая задержка между запросами
-            time.sleep(0.2)
+            time.sleep(0.1)
         
         return downloaded_images
     
@@ -326,9 +347,8 @@ class WildberriesParser:
         return saved_count
 
     def _process_product_images_fast(self, product: Product) -> bool:
-        """Быстрая обработка изображений с возможностью загрузки всех изображений"""
+        """Быстрая обработка изображений с загрузкой только больших изображений"""
         try:
-            # Используем новый метод для получения всех изображений
             downloaded_images = self.download_all_images(product.product_id)
             
             if not downloaded_images:
@@ -340,6 +360,10 @@ class WildberriesParser:
             
             for img in downloaded_images:
                 try:
+                    # Пропускаем маленькие изображения
+                    if 'big' not in img['size'].lower() and 'original' not in img['size'].lower():
+                        continue
+                        
                     img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:6]}.{img['type']}"
                     
                     product_image = ProductImage(
@@ -351,7 +375,7 @@ class WildberriesParser:
                     product_image.image.save(img_name, File(img['data']), save=True)
                     saved_count += 1
                     
-                    # Устанавливаем первое изображение как основное
+                    # Устанавливаем первое большое изображение как основное
                     if not main_image_set:
                         product.image_url = img['url']
                         product.save()
@@ -368,8 +392,9 @@ class WildberriesParser:
             return False
 
     def _extract_price_info(self, product: Dict) -> Dict[str, Optional[float]]:
-        """Извлекает информацию о ценах товара"""
+        """Извлекает информацию о ценах товара с округлением в меньшую сторону"""
         price = discount_price = wildberries_card_price = None
+        has_wb_card_discount = False
         
         if 'sizes' in product and product['sizes']:
             for size in product['sizes']:
@@ -381,11 +406,12 @@ class WildberriesParser:
                     if product_price > 0 and product_price < basic:
                         price = basic
                         discount_price = product_price
-                        wildberries_card_price = round(product_price * 0.9, 2)
+                        wildberries_card_price = math.floor(product_price * 0.9 * 100) / 100  # Округление вниз
+                        has_wb_card_discount = True
                         break
                     else:
                         price = basic if basic > 0 else product_price
-                        wildberries_card_price = round(price * 0.9, 2)
+                        wildberries_card_price = math.floor(price * 0.9 * 100) / 100  # Округление вниз
         
         if price is None:
             original = product.get('priceU', 0) / 100
@@ -394,27 +420,29 @@ class WildberriesParser:
             if sale > 0 and sale < original:
                 price = original
                 discount_price = sale
-                wildberries_card_price = round(sale * 0.9, 2)
+                wildberries_card_price = math.floor(sale * 0.9 * 100) / 100  # Округление вниз
+                has_wb_card_discount = True
             else:
                 price = original if original > 0 else sale
-                wildberries_card_price = round(price * 0.9, 2)
+                wildberries_card_price = math.floor(price * 0.9 * 100) / 100  # Округление вниз
         
         if 'extended' in product and 'basicPriceU' in product['extended']:
             basic_ext = product['extended']['basicPriceU'] / 100
             if price is None or (basic_ext > 0 and basic_ext < price):
                 price = basic_ext
-                wildberries_card_price = round(price * 0.9, 2)
+                wildberries_card_price = math.floor(price * 0.9 * 100) / 100  # Округление вниз
         
         if 'clientSale' in product and discount_price:
             client_sale = product['clientSale']
             if client_sale > 0:
-                discount_price = round(discount_price * (1 - client_sale / 100), 2)
-                wildberries_card_price = round(discount_price * 0.9, 2)
+                discount_price = math.floor(discount_price * (1 - client_sale / 100) * 100) / 100  # Округление вниз
+                wildberries_card_price = math.floor(discount_price * 0.9 * 100) / 100  # Округление вниз
         
         return {
             'price': price if price else 0.0,
             'discount_price': discount_price if discount_price and discount_price < price else None,
-            'wildberries_card_price': wildberries_card_price if wildberries_card_price else None
+            'wildberries_card_price': wildberries_card_price if has_wb_card_discount else None,
+            'has_wb_card_discount': has_wb_card_discount
         }
 
     def _parse_products(self, products_data: List[Dict]) -> List[Dict]:
@@ -439,10 +467,12 @@ class WildberriesParser:
                 image_urls = self._generate_all_image_urls(int(product_id))
                 first_image = image_urls[0] if image_urls else ""
                 
+                price_info = self._extract_price_info(product)
+                
                 parsed_product = {
                     'product_id': str(product_id),
                     'name': product.get('name', ''),
-                    **self._extract_price_info(product),
+                    **price_info,
                     'rating': float(rating) if rating else 0.0,
                     'reviews_count': int(reviews) if reviews else 0,
                     'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
@@ -478,7 +508,8 @@ class WildberriesParser:
                         'product_url': product_data['product_url'],
                         'category': product_data['category'],
                         'search_query': product_data['search_query'],
-                        'image_url': product_data['image_url']
+                        'image_url': product_data['image_url'],
+                        'has_wb_card_discount': product_data.get('has_wb_card_discount', False)
                     }
                 )
                 
@@ -562,3 +593,168 @@ class WildberriesParser:
     def parse_products(self, query: str, category: str = "", limit: int = 10) -> int:
         """Алиас для parse_and_save"""
         return self.parse_and_save(query, category, limit)
+    
+    async def _fetch_product_data(self, product_id: int) -> Optional[Dict]:
+        """Получение полных данных о товаре через API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://card.wb.ru/cards/detail?nm={product_id}"
+                async with session.get(url, headers={'User-Agent': self.ua.random}) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get('data', {}).get('products', [{}])[0]
+        except Exception as e:
+            logger.error(f"Ошибка получения данных товара {product_id}: {str(e)}")
+        return None
+
+    async def _process_single_product(self, product_data: Dict) -> Dict:
+        """Асинхронная обработка одного товара"""
+        product_id = product_data.get('id')
+        if not product_id:
+            return {}
+
+        # Получаем дополнительные данные
+        full_data = await self._fetch_product_data(product_id)
+        
+        # Формируем данные товара
+        product = {
+            'product_id': str(product_id),
+            'name': product_data.get('name', ''),
+            **self._extract_price_info(product_data),
+            'rating': self._get_rating(product_data),
+            'reviews_count': self._get_reviews_count(product_data),
+            'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
+            'image_url': '',
+            'images': [],
+            'category': '',
+            'search_query': '',
+            'brand': full_data.get('brand', '') if full_data else '',
+            'description': full_data.get('description', '') if full_data else ''
+        }
+
+        # Получаем изображения
+        image_urls = await self._get_valid_image_urls_async(product_id)
+        if image_urls:
+            product['image_url'] = image_urls[0]['url']
+            product['images'] = image_urls[:self.image_limits['download']]
+
+        return product
+
+    async def parse_products_async(self, query: str, category: str = "", limit: int = 10) -> List[Dict]:
+        """Асинхронный парсинг товаров"""
+        products_data = self.search_products(query, limit)
+        if not products_data:
+            return []
+
+        category = category or "Без категории"
+        tasks = [self._process_single_product(p) for p in products_data]
+        results = await asyncio.gather(*tasks)
+        
+        # Добавляем категорию и запрос
+        for product in results:
+            if product:
+                product['category'] = category
+                product['search_query'] = query
+
+        return [p for p in results if p]
+
+    def save_product_with_images(self, product_data: Dict) -> bool:
+        """Сохранение товара с изображениями"""
+        try:
+            # Создаем/обновляем товар
+            product, created = Product.objects.update_or_create(
+                product_id=product_data['product_id'],
+                defaults={
+                    'name': product_data['name'],
+                    'price': product_data['price'],
+                    'discount_price': product_data['discount_price'],
+                    'wildberries_card_price': product_data.get('wildberries_card_price'),
+                    'rating': product_data['rating'],
+                    'reviews_count': product_data['reviews_count'],
+                    'product_url': product_data['product_url'],
+                    'category': product_data['category'],
+                    'search_query': product_data['search_query'],
+                    'image_url': product_data['image_url'],
+                    'brand': product_data.get('brand', ''),
+                    'description': product_data.get('description', '')
+                }
+            )
+
+            # Удаляем старые изображения, если они есть
+            product.images.all().delete()
+
+            # Сохраняем новые изображения
+            for img_data in product_data.get('images', [])[:10]:  # Сохраняем до 10 изображений
+                try:
+                    img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:6]}.{img_data['type']}"
+                    
+                    # Создаем объект изображения
+                    img_file = File(BytesIO(img_data['data']), name=img_name)
+                    
+                    # Сохраняем изображение
+                    ProductImage.objects.create(
+                        product=product,
+                        image=img_file,
+                        image_url=img_data['url'],
+                        image_size=img_data.get('size', ''),
+                        image_type=img_data.get('type', ''),
+                        is_main=(img_data['url'] == product.image_url)
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка сохранения изображения: {str(e)}")
+
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения товара {product_data.get('product_id')}: {str(e)}")
+            return False
+        
+    async def _get_valid_image_urls_async(self, product_id: int) -> List[Dict]:
+        """Асинхронная проверка URL изображений с кешированием"""
+        cache_key = f"wb_images_{product_id}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        urls = self._generate_all_image_urls(product_id)
+        valid_urls = []
+        
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=10),
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={'User-Agent': self.ua.random}
+        ) as session:
+            tasks = []
+            for url in urls[:self.image_limits['check_urls']]:
+                task = asyncio.create_task(self._check_and_analyze_image(session, url))
+                tasks.append(task)
+                await asyncio.sleep(0.01)  # Небольшая задержка
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_urls = [r for r in results if r and not isinstance(r, Exception)]
+
+        # Сортируем изображения по приоритету (большие первыми)
+        valid_urls.sort(key=lambda x: (
+            -1 if 'big' in x['url'] else 
+            -0.5 if 'c516x688' in x['url'] else 
+            0
+        ))
+
+        cache.set(cache_key, valid_urls, timeout=3600)  # Кешируем на 1 час
+        return valid_urls[:self.image_limits['download']]
+
+    async def _check_and_analyze_image(self, session, url: str) -> Optional[Dict]:
+        """Проверка и анализ изображения"""
+        try:
+            async with session.head(url, allow_redirects=True) as response:
+                if response.status == 200:
+                    content_type = response.headers.get('Content-Type', '')
+                    if content_type.startswith('image/'):
+                        img_type = content_type.split('/')[-1].split(';')[0]
+                        return {
+                            'url': str(response.url),
+                            'type': img_type,
+                            'size': self._get_size_from_url(str(response.url))
+                        }
+        except Exception:
+            pass
+        return None
