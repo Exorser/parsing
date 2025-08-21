@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from django.utils.safestring import mark_safe  # Добавьте этот импорт
+from django.contrib.auth.models import User
 
 class Product(models.Model):
     """Модель товара"""
@@ -23,6 +24,10 @@ class Product(models.Model):
     has_wb_card_discount = models.BooleanField(
         default=False,
         verbose_name="Есть скидка по карте Wildberries"
+    )
+    has_wb_card_payment = models.BooleanField(
+        default=False,
+        verbose_name="Доступна оплата картой Wildberries"
     )
     rating = models.DecimalField(
         max_digits=3, 
@@ -70,6 +75,14 @@ class Product(models.Model):
         auto_now=True, 
         verbose_name="Дата обновления"
     )
+    quantity = models.IntegerField(
+        default=0,
+        verbose_name="Количество в наличии"
+    )
+    is_available = models.BooleanField(
+        default=True,
+        verbose_name="Товар в наличии"
+    )
 
     class Meta:
         verbose_name = "Товар"
@@ -80,6 +93,8 @@ class Product(models.Model):
             models.Index(fields=['category']),
             models.Index(fields=['search_query']),
             models.Index(fields=['has_wb_card_discount']),
+            models.Index(fields=['has_wb_card_payment']),
+            models.Index(fields=['is_available']),
         ]
 
     def __str__(self):
@@ -114,6 +129,31 @@ class Product(models.Model):
         if self.images.exists():
             return self.images.first().image.url
         return self.image_url if self.image_url else None
+    
+    @property
+    def availability_status(self):
+        """Возвращает статус наличия товара"""
+        if self.quantity > 0:
+            return "В наличии"
+        elif self.quantity == 0:
+            return "Нет в наличии"
+        else:
+            return "Неизвестно"
+    
+    @property
+    def availability_class(self):
+        """Возвращает CSS класс для отображения статуса"""
+        if self.quantity > 0:
+            return "available"
+        elif self.quantity == 0:
+            return "out-of-stock"
+        else:
+            return "unknown"
+        
+    @property
+    def should_show_card_price(self):
+        """Показывать ли цену по карте Wildberries"""
+        return self.has_wb_card_payment and self.wildberries_card_price is not None
 
 class ProductImage(models.Model):
     """Модель для хранения изображений товаров"""
@@ -132,3 +172,34 @@ class ProductImage(models.Model):
 
     def __str__(self):
         return f"Изображение для {self.product.name[:30]}"
+    
+class SearchSession(models.Model):
+        """Сессия поиска пользователя"""
+        user = models.ForeignKey(User, on_delete=models.CASCADE)
+        query = models.CharField(max_length=255)
+        category = models.CharField(max_length=100, blank=True)
+        created_at = models.DateTimeField(auto_now_add=True)
+        last_active = models.DateTimeField()
+        last_parsed = models.DateTimeField(null=True, blank=True)
+        total_products = models.IntegerField(default=0)
+        pages_parsed = models.IntegerField(default=0)
+        
+        class Meta:
+            indexes = [
+                models.Index(fields=['user', 'query']),
+                models.Index(fields=['last_active']),
+            ]
+            unique_together = ['user', 'query', 'category']
+
+class ProductSearchResult(models.Model):
+        """Связь между товаром и поисковой сессией"""
+        search_session = models.ForeignKey(SearchSession, on_delete=models.CASCADE)
+        product = models.ForeignKey(Product, on_delete=models.CASCADE)
+        parsed_at = models.DateTimeField(auto_now_add=True)
+        shown_to_user = models.BooleanField(default=False)
+        
+        class Meta:
+            indexes = [
+                models.Index(fields=['search_session', 'parsed_at']),
+            ]
+            unique_together = ['search_session', 'product']

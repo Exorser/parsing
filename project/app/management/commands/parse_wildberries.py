@@ -2,7 +2,6 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from app.parser import WildberriesParser
 
-
 class Command(BaseCommand):
     help = 'Парсинг товаров с Wildberries по заданному запросу'
 
@@ -42,7 +41,6 @@ class Command(BaseCommand):
         parser = WildberriesParser()
         
         try:
-            # Парсим и сохраняем товары
             saved_count = parser.parse_and_save(query, category, limit)
 
             if saved_count == 0:
@@ -54,6 +52,6 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.SUCCESS(f'Успешно сохранено товаров: {saved_count}')
             )
-
+            
         except Exception as e:
-            raise CommandError(f'Ошибка при парсинге: {e}') 
+            raise CommandError(f'Ошибка при парсинге: {e}')

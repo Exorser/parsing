@@ -291,4 +291,7 @@
   flex: 1;
 }
 
+.available { color: green; }
+.out-of-stock { color: red; }
+.unknown { color: orange; }
 /* ... остальные ваши стили ... */

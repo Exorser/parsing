@@ -15,9 +15,23 @@ from functools import lru_cache
 from PIL import Image
 import uuid
 import time
+from functools import wraps
 import math
+from asgiref.sync import sync_to_async
 
 logger = logging.getLogger(__name__)
+
+# Декоратор для измерения времени
+def timing_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        logger.info(f"Метод {func.__name__} выполнился за {execution_time:.2f} секунд")
+        return result
+    return wrapper
 
 class WildberriesParser:
     def __init__(self):
@@ -29,8 +43,11 @@ class WildberriesParser:
         self.max_workers = 10
         self.image_limits = {
             'check_urls': 50,  # Максимум URL для проверки
-            'download': 10     # Максимум изображений для загрузки
+            'download': 16     # Максимум изображений для загрузки
         }
+        self.total_parsing_time = 0
+        self.parsing_count = 0
+        
         
         self.session.headers.update({
             'User-Agent': self.ua.random,
@@ -46,6 +63,7 @@ class WildberriesParser:
             'Referer': 'https://www.wildberries.ru/'
         })
 
+    @timing_decorator
     def search_products(self, query: str, limit: int = 10) -> List[Dict]:
         """Поиск разнообразных товаров (разные цены, рейтинги)"""
         try:
@@ -115,6 +133,40 @@ class WildberriesParser:
             logger.error(f"Ошибка при поиске разнообразных товаров: {e}", exc_info=True)
             return []
 
+    def get_product_data(self, product_id: int) -> Optional[Dict]:
+        """Получение данных конкретного товара по ID"""
+        try:
+            response = requests.get(
+                f"https://card.wb.ru/cards/detail?nm={product_id}",
+                headers={'User-Agent': self.ua.random},
+                timeout=5
+            )
+            if response.status_code != 200:
+                return None
+                
+            data = response.json()
+            products = data.get('data', {}).get('products', [])
+            if not products:
+                return None
+                
+            product = products[0]
+            
+            # Преобразуем в тот же формат, что и search_products
+            return {
+                'product_id': str(product.get('id')),
+                'name': product.get('name', ''),
+                'price': product.get('priceU', 0) / 100,
+                'discount_price': product.get('discount_price', 0) / 100,
+                'rating': product.get('rating', 0),
+                'reviews_count': product.get('reviews_count', 0),
+                'quantity': product.get('quantity', 0),
+                # Добавьте другие необходимые поля
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения данных товара {product_id}: {str(e)}")
+            return None
+    
     def _get_image_urls_from_api(self, product_id: int) -> List[str]:
         """Получение URL изображений через API с проверкой доступности"""
         try:
@@ -148,13 +200,13 @@ class WildberriesParser:
         part = product_id // 1000
 
         # Основные серверы (1-40)
-        servers = list(range(1, 41))
+        servers = list(range(1, 40))
         
         # Альтернативные домены
         domains = ['wbbasket.ru', 'wb.ru', 'wildberries.ru']
         
         # Только большие форматы изображений
-        formats = ['big', 'c516x688', 'original']
+        formats = ['big', 'c516x688']
         
         # Генерация всех возможных комбинаций URL
         for domain in domains:
@@ -170,19 +222,15 @@ class WildberriesParser:
 
         # Добавляем только большие URL из API Wildberries
         api_urls = self._get_image_urls_from_api(product_id)
-        urls.update(api_urls)
+        if api_urls:
+            urls.update(api_urls[:4])
 
         # Только большие форматы WB
         urls.update({
             f"https://images.wbstatic.net/big/new/{product_id}-1.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-2.jpg",
-            f"https://images.wbstatic.net/big/new/{product_id}-3.jpg",
-            f"https://images.wbstatic.net/c516x688/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/c516x688/new/{product_id}-2.jpg",
             f"https://images.wbstatic.net/big/new/{product_id}-1.webp",
             f"https://images.wbstatic.net/big/new/{product_id}-2.webp",
-            f"https://images.wbstatic.net/original/new/{product_id}-1.jpg",
-            f"https://images.wbstatic.net/original/new/{product_id}-2.jpg"
         })
 
         # CDN URL только большие
@@ -193,7 +241,7 @@ class WildberriesParser:
             f"https://cdn.wbstatic.net/c516x688/new/{product_id}-2.jpg"
         })
 
-        return list(urls)
+        return list(urls)[:350]
 
     async def _check_url_available(self, session: aiohttp.ClientSession, url: str) -> Optional[Tuple[str, str]]:
         """Проверка доступности URL с возвратом типа контента"""
@@ -257,70 +305,131 @@ class WildberriesParser:
     def get_all_image_urls(self, product_id: int) -> List[Dict[str, str]]:
         """Синхронная обертка для получения всех URL изображений"""
         return asyncio.run(self._get_all_valid_image_urls_async(product_id))
+    
+    
+    # def _download_image(self, url: str) -> Optional[Tuple[BytesIO, str]]:
+    #     """Загрузка изображения с возвратом данных и типа"""
+    #     try:
+    #         headers = {
+    #             'User-Agent': self.ua.random,
+    #             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+    #             'Referer': 'https://www.wildberries.ru/',
+    #         }
+            
+    #         response = requests.get(url, headers=headers, 
+    #                             stream=True, timeout=(3.05, 10))
+    #         response.raise_for_status()
+            
+    #         content_type = response.headers.get('Content-Type', '')
+    #         if not content_type.startswith('image/'):
+    #             return None
+                
+    #         img_data = BytesIO()
+    #         for chunk in response.iter_content(chunk_size=8192):
+    #             img_data.write(chunk)
+                
+    #         img_data.seek(0)
+            
+    #         # Проверка валидности изображения
+    #         try:
+    #             img = Image.open(img_data)
+    #             img.verify()
+    #             img_data.seek(0)
+    #             return (img_data, content_type.split('/')[-1].split(';')[0])
+    #         except:
+    #             return None
+                
+    #     except Exception as e:
+    #         logger.debug(f"Ошибка загрузки изображения {url}: {str(e)}")
+    #         return None
 
-    def _download_image(self, url: str) -> Optional[Tuple[BytesIO, str]]:
-        """Загрузка изображения с возвратом данных и типа"""
-        try:
-            headers = {
-                'User-Agent': self.ua.random,
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-                'Referer': 'https://www.wildberries.ru/',
-            }
-            
-            response = requests.get(url, headers=headers, 
-                                stream=True, timeout=(3.05, 10))
-            response.raise_for_status()
-            
-            content_type = response.headers.get('Content-Type', '')
-            if not content_type.startswith('image/'):
-                return None
-                
-            img_data = BytesIO()
-            for chunk in response.iter_content(chunk_size=8192):
-                img_data.write(chunk)
-                
-            img_data.seek(0)
-            
-            # Проверка валидности изображения
-            try:
-                img = Image.open(img_data)
-                img.verify()
-                img_data.seek(0)
-                return (img_data, content_type.split('/')[-1].split(';')[0])
-            except:
-                return None
-                
-        except Exception as e:
-            logger.debug(f"Ошибка загрузки изображения {url}: {str(e)}")
-            return None
+    @timing_decorator  
+    async def download_images_async(self, product_id: int) -> List[Dict[str, Any]]:
+        """Асинхронная загрузка всех изображений для товара"""
+        start_time = time.time()
         
-    def download_all_images(self, product_id: int) -> List[Dict[str, Any]]:
-        """Загрузка всех доступных изображений для товара"""
-        image_urls = self.get_all_image_urls(product_id)
+        image_urls = await self._get_valid_image_urls_async(product_id)
+        if not image_urls:
+            logger.warning(f"Не найдено рабочих URL для товара {product_id}")
+            return []
+        
         downloaded_images = []
         
-        for img_info in image_urls[:self.image_limits['download']]:  # Ограничиваем количество загружаемых изображений
-            url = img_info['url']
-            result = self._download_image(url)
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=10),
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={'User-Agent': self.ua.random}
+        ) as session:
+            tasks = []
+            for img_info in image_urls[:self.image_limits['download']]:
+                tasks.append(self._download_image_async(session, img_info))
             
-            if result:
-                img_data, img_type = result
-                downloaded_images.append({
-                    'url': url,
-                    'type': img_type,
-                    'size': img_info['size'],
-                    'data': img_data
-                })
-                logger.info(f"Успешно загружено изображение {url}")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Небольшая задержка между запросами
-            time.sleep(0.1)
+            for i, result in enumerate(results):
+                if result and not isinstance(result, Exception):
+                    downloaded_images.append(result)
+                    logger.info(f"Успешно загружено изображение {i+1} для {product_id}")
+                elif isinstance(result, Exception):
+                    logger.warning(f"Ошибка загрузки изображения {i+1} для {product_id}: {result}")
+        
+        end_time = time.time()
+        logger.info(f"Загрузка изображений для {product_id} заняла {end_time - start_time:.2f} сек, загружено: {len(downloaded_images)}")
         
         return downloaded_images
     
+    @timing_decorator 
+    async def _download_image_async(self, session: aiohttp.ClientSession, img_info: Dict) -> Optional[Dict]:
+        """Асинхронная загрузка одного изображения с повторными попытками"""
+        max_retries = 3
+        url = img_info['url']
+        
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        if content_type and content_type.startswith('image/'):
+                            img_data = await response.read()
+                            
+                            # Проверяем, что это валидное изображение
+                            try:
+                                img = Image.open(BytesIO(img_data))
+                                img.verify()
+                                return {
+                                    'url': str(response.url),
+                                    'type': content_type.split('/')[-1].split(';')[0],
+                                    'size': img_info['size'],
+                                    'data': BytesIO(img_data)
+                                }
+                            except Exception:
+                                logger.warning(f"Невалидное изображение: {url}")
+                                return None
+                    
+                    elif response.status == 404:
+                        logger.debug(f"Изображение не найдено: {url}")
+                        return None
+                        
+            except asyncio.TimeoutError:
+                logger.debug(f"Таймаут загрузки {url} (попытка {attempt + 1})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    return None
+                    
+            except Exception as e:
+                logger.debug(f"Ошибка загрузки {url}: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    return None
+        
+        return None
+    
+    @timing_decorator
     def save_all_product_images(self, product: Product) -> int:
         """Сохранение всех изображений товара"""
-        downloaded_images = self.download_all_images(product.product_id)
+        downloaded_images = self.download_images_async(product.product_id)
         saved_count = 0
         
         for img in downloaded_images:
@@ -346,50 +455,92 @@ class WildberriesParser:
         
         return saved_count
 
-    def _process_product_images_fast(self, product: Product) -> bool:
-        """Быстрая обработка изображений с загрузкой только больших изображений"""
+    async def _process_product_images_async(self, product: Product) -> bool:
+        """Асинхронная обработка изображений"""
         try:
-            downloaded_images = self.download_all_images(product.product_id)
+            downloaded_images = await self.download_images_async(product.product_id)
             
             if not downloaded_images:
-                logger.warning(f"Не найдено рабочих изображений для товара {product.product_id}")
+                logger.warning(f"Не найдено изображений для товара {product.product_id}")
                 return False
+            
+            # Сохраняем только первое изображение как основное
+            if downloaded_images:
+                main_image = downloaded_images[0]
+                # Обертываем обновление в sync_to_async
+                await sync_to_async(setattr)(product, 'image_url', main_image['url'])
+                await sync_to_async(product.save)()
                 
-            saved_count = 0
-            main_image_set = False
+                # Остальные изображения можно сохранять в фоне
+                asyncio.create_task(self._save_additional_images_async(product, downloaded_images[1:]))
             
-            for img in downloaded_images:
-                try:
-                    # Пропускаем маленькие изображения
-                    if 'big' not in img['size'].lower() and 'original' not in img['size'].lower():
-                        continue
-                        
-                    img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:6]}.{img['type']}"
-                    
-                    product_image = ProductImage(
-                        product=product,
-                        image_url=img['url'],
-                        image_size=img['size'],
-                        image_type=img['type']
-                    )
-                    product_image.image.save(img_name, File(img['data']), save=True)
-                    saved_count += 1
-                    
-                    # Устанавливаем первое большое изображение как основное
-                    if not main_image_set:
-                        product.image_url = img['url']
-                        product.save()
-                        main_image_set = True
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка сохранения изображения {img['url']}: {str(e)}", exc_info=True)
-            
-            logger.info(f"Сохранено {saved_count} изображений для товара {product.product_id}")
-            return saved_count > 0
+            return True
             
         except Exception as e:
-            logger.error(f"Критическая ошибка обработки изображений для товара {product.product_id}: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка обработки изображений: {str(e)}")
             return False
+        
+    async def _save_additional_images_async(self, product: Product, images: List[Dict]):
+        """Фоновая сохранение дополнительных изображений"""
+        for img in images:
+            try:
+                img_name = f"wb_{product.product_id}_{uuid.uuid4().hex[:6]}.{img['type']}"
+                
+                # Создаем ProductImage асинхронно
+                product_image = ProductImage(
+                    product=product,
+                    image_url=img['url'],
+                    image_size=img['size'],
+                    image_type=img['type']
+                )
+                
+                # Обертываем сохранение в sync_to_async
+                await sync_to_async(product_image.image.save)(
+                    img_name, 
+                    File(img['data']), 
+                    save=True
+                )
+                
+            except Exception as e:
+                logger.error(f"Ошибка сохранения дополнительного изображения: {str(e)}")
+
+    def _extract_quantity_info(self, product: Dict) -> Dict[str, Any]:
+        """Извлекает информацию о наличии товара"""
+        quantity = 0
+        is_available = False
+        
+        # Проверяем наличие в разных структурах данных Wildberries
+        if 'sizes' in product and product['sizes']:
+            for size in product['sizes']:
+                if 'stocks' in size and size['stocks']:
+                    for stock in size['stocks']:
+                        qty = stock.get('qty', 0)
+                        quantity += qty
+                        if qty > 0:
+                            is_available = True
+        
+        # Альтернативные пути к данным о количестве
+        if quantity == 0:
+            quantity = product.get('totalQuantity', 0)
+            if quantity > 0:
+                is_available = True
+        
+        if quantity == 0:
+            quantity = product.get('quantity', 0)
+            if quantity > 0:
+                is_available = True
+        
+        # Проверяем extended данные
+        if 'extended' in product:
+            ext_quantity = product['extended'].get('basicSale', 0)
+            if ext_quantity > 0:
+                quantity = ext_quantity
+                is_available = True
+        
+        return {
+            'quantity': quantity,
+            'is_available': is_available
+        }
 
     def _extract_price_info(self, product: Dict) -> Dict[str, Optional[float]]:
         """Извлекает информацию о ценах товара с округлением в меньшую сторону"""
@@ -466,13 +617,15 @@ class WildberriesParser:
                 # Используем новый метод для генерации всех URL
                 image_urls = self._generate_all_image_urls(int(product_id))
                 first_image = image_urls[0] if image_urls else ""
-                
+
+                quantity_info = self._extract_quantity_info(product)
                 price_info = self._extract_price_info(product)
                 
                 parsed_product = {
                     'product_id': str(product_id),
                     'name': product.get('name', ''),
                     **price_info,
+                    **quantity_info, 
                     'rating': float(rating) if rating else 0.0,
                     'reviews_count': int(reviews) if reviews else 0,
                     'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
@@ -489,14 +642,14 @@ class WildberriesParser:
         
         return parsed_products
 
-    def save_products(self, products: List[Dict]) -> int:
-        """Сохранение товаров с обработкой ошибок и всеми изображениями"""
+    async def _save_products_async(self, products_data: List[Dict]) -> int:
+        """Асинхронное сохранение товаров"""
         saved_count = 0
         
-        for product_data in products:
+        for product_data in products_data:
             try:
-                # Создаем/обновляем товар (без изображения сначала)
-                product, created = Product.objects.update_or_create(
+                # Обертываем ORM вызовы в sync_to_async
+                product, created = await sync_to_async(Product.objects.update_or_create)(
                     product_id=product_data['product_id'],
                     defaults={
                         'name': product_data['name'],
@@ -509,20 +662,20 @@ class WildberriesParser:
                         'category': product_data['category'],
                         'search_query': product_data['search_query'],
                         'image_url': product_data['image_url'],
-                        'has_wb_card_discount': product_data.get('has_wb_card_discount', False)
+                        'has_wb_card_discount': product_data.get('has_wb_card_discount', False),
+                        'quantity': product_data.get('quantity', 0),
+                        'is_available': product_data.get('is_available', False)
                     }
                 )
                 
-                # Используем обновленный метод для сохранения всех изображений
-                if self._process_product_images_fast(product):
+                # Асинхронная обработка изображений
+                if await self._process_product_images_async(product):
                     saved_count += 1
-                    logger.info(f"Успешно сохранен товар {product.product_id} с изображениями")
-                else:
-                    logger.warning(f"Товар {product.product_id} сохранен без изображений")
+                    logger.info(f"Успешно сохранен товар {product.product_id}")
                     
             except Exception as e:
-                logger.error(f"Критическая ошибка сохранения товара {product_data.get('product_id')}: {str(e)}")
-                
+                logger.error(f"Ошибка сохранения товара {product_data.get('product_id')}: {str(e)}")
+        
         return saved_count
     
     def calculate_price_statistics(self, products: List[Product]) -> Dict:
@@ -567,33 +720,50 @@ class WildberriesParser:
                 distribution['1-2'] += 1
         
         return distribution
-
-    def parse_and_save(self, query: str, category: str = "", limit: int = 10) -> int:
-        """Основной метод для парсинга и сохранения с улучшенной обработкой изображений"""
-        products = self.search_products(query, limit)
+    
+    @timing_decorator
+    async def parse_and_save_async(self, query: str, category: str = "", limit: int = 10) -> int:
+        """Асинхронный парсинг и сохранение"""
+        start_time = time.time()
         
-        if not products:
+        products_data = self.search_products(query, limit)
+        if not products_data:
             return 0
 
         category = category or "Без категории"
-        for product in products:
+        for product in products_data:
             product['search_query'] = query
             product['category'] = category
 
-        saved_count = self.save_products(products)
+        # Параллельная обработка товаров
+        saved_count = await self._save_products_async(products_data)
         
-        # Дополнительная статистика по изображениям
-        total_images = sum(len(p.get('image_urls', [])) for p in products)
+        end_time = time.time()
+        total_time = end_time - start_time
+        
         logger.info(
-            f"Парсинг завершен! Сохранено товаров: {saved_count}/{len(products)}, "
-            f"всего URL изображений: {total_images}"
+            f"Парсинг завершен! Время: {total_time:.2f} сек, "
+            f"Сохранено: {saved_count}/{len(products_data)}, "
+            f"Среднее время на товар: {total_time/len(products_data):.2f} сек"
         )
         return saved_count
+    
+    def get_performance_stats(self):
+        """Возвращает статистику производительности"""
+        return {
+            'total_parsing_time': self.total_parsing_time,
+            'parsing_count': self.parsing_count,
+            'average_time': self.total_parsing_time / self.parsing_count if self.parsing_count > 0 else 0
+        }
 
     def parse_products(self, query: str, category: str = "", limit: int = 10) -> int:
         """Алиас для parse_and_save"""
         return self.parse_and_save(query, category, limit)
     
+    def parse_and_save(self, query: str, category: str = "", limit: int = 10) -> int:
+        """Синхронная обертка для обратной совместимости"""
+        return asyncio.run(self.parse_and_save_async(query, category, limit))
+
     async def _fetch_product_data(self, product_id: int) -> Optional[Dict]:
         """Получение полных данных о товаре через API"""
         try:
@@ -606,6 +776,42 @@ class WildberriesParser:
         except Exception as e:
             logger.error(f"Ошибка получения данных товара {product_id}: {str(e)}")
         return None
+    
+    async def _fetch_product_availability(self, product_id: int) -> Dict[str, Any]:
+        """Получение информации о наличии товара через API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://card.wb.ru/cards/detail?nm={product_id}"
+                async with session.get(url, headers={'User-Agent': self.ua.random}) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        products = data.get('data', {}).get('products', [])
+                        if products:
+                            return self._extract_quantity_info(products[0])
+        except Exception as e:
+            logger.error(f"Ошибка получения наличия товара {product_id}: {str(e)}")
+        return {'quantity': 0, 'is_available': False}
+
+    def get_product_availability(self, product_id: int) -> Dict[str, Any]:
+        """Синхронная обертка для получения информации о наличии"""
+        return asyncio.run(self._fetch_product_availability(product_id))
+
+    def update_products_availability(self, products: List[Product]) -> int:
+        """Обновление информации о наличии для списка товаров"""
+        updated_count = 0
+        
+        for product in products:
+            try:
+                availability = self.get_product_availability(int(product.product_id))
+                product.quantity = availability['quantity']
+                product.is_available = availability['is_available']
+                product.save()
+                updated_count += 1
+                logger.info(f"Обновлено наличие для товара {product.product_id}: {availability}")
+            except Exception as e:
+                logger.error(f"Ошибка обновления наличия для товара {product.product_id}: {str(e)}")
+        
+        return updated_count
 
     async def _process_single_product(self, product_data: Dict) -> Dict:
         """Асинхронная обработка одного товара"""
@@ -639,24 +845,6 @@ class WildberriesParser:
             product['images'] = image_urls[:self.image_limits['download']]
 
         return product
-
-    async def parse_products_async(self, query: str, category: str = "", limit: int = 10) -> List[Dict]:
-        """Асинхронный парсинг товаров"""
-        products_data = self.search_products(query, limit)
-        if not products_data:
-            return []
-
-        category = category or "Без категории"
-        tasks = [self._process_single_product(p) for p in products_data]
-        results = await asyncio.gather(*tasks)
-        
-        # Добавляем категорию и запрос
-        for product in results:
-            if product:
-                product['category'] = category
-                product['search_query'] = query
-
-        return [p for p in results if p]
 
     def save_product_with_images(self, product_data: Dict) -> bool:
         """Сохранение товара с изображениями"""
@@ -710,51 +898,87 @@ class WildberriesParser:
         
     async def _get_valid_image_urls_async(self, product_id: int) -> List[Dict]:
         """Асинхронная проверка URL изображений с кешированием"""
+        logger.info(f"Начинаем поиск URL для товара {product_id}")
+        
         cache_key = f"wb_images_{product_id}"
         cached = cache.get(cache_key)
         if cached:
+            logger.info(f"Найдены кешированные URL для {product_id}: {len(cached)} шт")
             return cached
 
         urls = self._generate_all_image_urls(product_id)
+        logger.info(f"Сгенерировано URL для {product_id}: {len(urls)} шт")
+        
         valid_urls = []
         
         async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=10),
-            timeout=aiohttp.ClientTimeout(total=10),
+            connector=aiohttp.TCPConnector(limit=20),
+            timeout=aiohttp.ClientTimeout(total=15),
             headers={'User-Agent': self.ua.random}
         ) as session:
-            tasks = []
-            for url in urls[:self.image_limits['check_urls']]:
-                task = asyncio.create_task(self._check_and_analyze_image(session, url))
-                tasks.append(task)
-                await asyncio.sleep(0.01)  # Небольшая задержка
-
+            # Проверяем все URL параллельно
+            tasks = [self._check_and_analyze_image(session, url) for url in urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            valid_urls = [r for r in results if r and not isinstance(r, Exception)]
+            
+            for result in results:
+                if result and not isinstance(result, Exception):
+                    valid_urls.append(result)
+                elif isinstance(result, Exception):
+                    logger.debug(f"Ошибка проверки URL: {result}")
 
-        # Сортируем изображения по приоритету (большие первыми)
+        logger.info(f"Найдено рабочих URL для {product_id}: {len(valid_urls)} шт")
+        
+        # Сортируем изображения по приоритету
         valid_urls.sort(key=lambda x: (
-            -1 if 'big' in x['url'] else 
-            -0.5 if 'c516x688' in x['url'] else 
-            0
+            0 if 'big' in x['url'] else 
+            1 if 'c516x688' in x['url'] else 
+            2
         ))
 
-        cache.set(cache_key, valid_urls, timeout=3600)  # Кешируем на 1 час
-        return valid_urls[:self.image_limits['download']]
+        cache.set(cache_key, valid_urls, timeout=3600)
+        return valid_urls[:8]
 
     async def _check_and_analyze_image(self, session, url: str) -> Optional[Dict]:
-        """Проверка и анализ изображения"""
-        try:
-            async with session.head(url, allow_redirects=True) as response:
-                if response.status == 200:
-                    content_type = response.headers.get('Content-Type', '')
-                    if content_type.startswith('image/'):
-                        img_type = content_type.split('/')[-1].split(';')[0]
-                        return {
-                            'url': str(response.url),
-                            'type': img_type,
-                            'size': self._get_size_from_url(str(response.url))
-                        }
-        except Exception:
-            pass
+        """Проверка и анализ изображения с повторными попытками"""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        if content_type and content_type.startswith('image/'):
+                            img_type = content_type.split('/')[-1].split(';')[0]
+                            return {
+                                'url': str(response.url),
+                                'type': img_type,
+                                'size': self._get_size_from_url(str(response.url))
+                            }
+                    elif response.status == 404:
+                        return None
+                        
+            except asyncio.TimeoutError:
+                logger.debug(f"Таймаут проверки URL {url} (попытка {attempt + 1})")
+                if attempt == max_retries - 1:
+                    return None
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.debug(f"Ошибка проверки URL {url}: {str(e)}")
+                if attempt == max_retries - 1:
+                    return None
+                await asyncio.sleep(0.5)
+        
         return None
+    def _get_rating(self, product_data: Dict) -> float:
+        """Извлечение рейтинга из данных товара"""
+        rating = product_data.get('rating', 0)
+        if isinstance(rating, dict):
+            return rating.get('rate', 0)
+        return float(rating) if rating else 0.0
+
+    def _get_reviews_count(self, product_data: Dict) -> int:
+        """Извлечение количества отзывов"""
+        reviews = product_data.get('feedbacks', 0)
+        if isinstance(reviews, dict):
+            return reviews.get('count', 0)
+        return int(reviews) if reviews else 0

@@ -76,6 +76,10 @@ function ProductDetail() {
         /> 
         <div className="product-info">
           <h1 className="product-title">{product.name}</h1>
+          <p className={`availability ${product.availability_class}`}>
+              {product.availability_status}
+              {product.quantity > 0 && ` (${product.quantity} шт.)`}
+          </p>
           <div className="product-price-section">
             {product.discount_price && product.discount_price < product.price ? (
               <div className="price-with-discount">
