@@ -268,6 +268,37 @@ class WildberriesParser:
         cache.set(cache_key, valid_urls, timeout=7200)  # Кешируем на 2 часа
         logger.info(f"Найдено {len(valid_urls)} валидных URL для {product_id}")
         return valid_urls
+    
+    def search_products_with_strategy(self, query: str, limit: int = 10, strategy: str = "default") -> List[Dict]:
+        """Поиск с разными стратегиями для бесплатного/платного бота"""
+        # Ищем в 3 раза больше товаров для фильтрации
+        raw_products = self.search_products(query, limit * 3)
+        
+        if not raw_products:
+            return []
+        
+        if strategy == "popular_midrange":
+            # Для бесплатного бота: средние цены, хорошие отзывы
+            filtered = [
+                p for p in raw_products 
+                if 500 <= p.get('price', 0) <= 100000  # Широкий диапазон
+                and p.get('rating', 0) >= 3.8         # Хороший рейтинг
+                and p.get('reviews_count', 0) >= 5    # Несколько отзывов
+            ]
+            # Сортируем по популярности (рейтинг + отзывы)
+            filtered.sort(key=lambda x: (x.get('rating', 0) * x.get('reviews_count', 1)), reverse=True)
+            
+        else:  # default strategy
+            filtered = raw_products
+        
+        # Убираем дубликаты по product_id
+        unique_products = {}
+        for product in filtered:
+            pid = product.get('product_id')
+            if pid and pid not in unique_products:
+                unique_products[pid] = product
+        
+        return list(unique_products.values())[:limit]
         
     async def _check_and_analyze_image(self, session, url: str) -> Optional[Dict]:
         """Ультра-быстрая проверка одного URL"""
@@ -376,7 +407,7 @@ class WildberriesParser:
     # Сохранение данных
 
     @async_timing_decorator
-    async def parse_and_save_async(self, query: str, category: str = "", limit: int = 10) -> int:
+    async def parse_and_save_async(self, query: str, limit: int = 10) -> int:
         """Парсинг с мониторингом успешности загрузки изображений"""
         products_data = self.search_products(query, limit)
 
@@ -531,9 +562,9 @@ class WildberriesParser:
         logger.info(f"Сохранено {saved_count} из {len(products_data)} товаров")
         
         # Сразу после сохранения пытаемся загрузить изображения для всех товаров
-        if saved_products:
-            logger.info(f"Запускаем принудительную загрузку изображений для {len(saved_products)} товаров")
-            await self.force_reload_images(saved_products)
+        # if saved_products:
+        #     logger.info(f"Запускаем принудительную загрузку изображений для {len(saved_products)} товаров")
+        #     await self.force_reload_images(saved_products)
         
         return saved_count
     
@@ -559,7 +590,6 @@ class WildberriesParser:
                     'rating': product_data.get('rating', 0),
                     'reviews_count': product_data.get('reviews_count', 0),
                     'product_url': product_data.get('product_url', ''),
-                    'category': product_data.get('category', ''),
                     'search_query': product_data.get('search_query', ''),
                     'image_url': product_data.get('image_url', ''),
                     'has_wb_card_discount': product_data.get('has_wb_card_discount', False),
@@ -680,7 +710,6 @@ class WildberriesParser:
                     'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
                     'image_url': first_image,
                     'image_urls': image_urls,
-                    'category': '',
                     'search_query': ''
                 }
                 
@@ -785,40 +814,48 @@ class WildberriesParser:
 
     @sync_timing_decorator
     def _get_image_urls_from_api(self, product_id: int) -> List[str]:
-        """Супер-быстрое получение URL через API"""
+        """Получение ТОЛЬКО правильных изображений через API"""
         try:
-            # Кешируем запросы к API
             cache_key = f"wb_api_{product_id}"
             cached = cache.get(cache_key)
             if cached:
                 return cached
                 
-            # Быстрый запрос с коротким таймаутом
             response = requests.get(
                 f"https://card.wb.ru/cards/detail?nm={product_id}",
                 headers={'User-Agent': self.ua.random},
-                timeout=3  # Увеличиваем таймаут до 3 секунд
+                timeout=5
             )
             
             if response.status_code == 200:
                 data = response.json()
                 products = data.get('data', {}).get('products', [])
-                if products and 'pics' in products[0]:
-                    pics = products[0]['pics']
-                    if pics:
-                        # Генерируем все возможные URL из API
-                        result = []
-                        for pic in pics[:5]:  # Берем первые 5 изображений
+                
+                if products:
+                    product_data = products[0]
+                    
+                    # Получаем ТОЛЬКО изображения ЭТОГО товара
+                    result = []
+                    
+                    # 1. Основные изображения из данных товара
+                    if 'pics' in product_data:
+                        for pic_id in product_data['pics'][:10]:  # Берем первые 10
                             result.extend([
-                                f"https://images.wbstatic.net/big/new/{pic}.jpg",
-                                f"https://basket-01.wb.ru/vol{pic//100000}/part{pic//1000}/{pic}/images/big/1.webp",
-                                f"https://basket-01.wbbasket.ru/vol{pic//100000}/part{pic//1000}/{pic}/images/big/1.webp",
+                                f"https://images.wbstatic.net/big/new/{pic_id}.jpg",
+                                f"https://basket-01.wb.ru/vol{pic_id//100000}/part{pic_id//1000}/{pic_id}/images/big/1.webp",
                             ])
-                        cache.set(cache_key, result, timeout=600)  # Кешируем на 10 минут
-                        return result
-                        
+                    
+                    # 2. Дополнительные проверенные URL
+                    result.extend([
+                        f"https://basket-01.wbbasket.ru/vol{product_id//100000}/part{product_id//1000}/{product_id}/images/big/1.webp",
+                        f"https://basket-02.wbbasket.ru/vol{product_id//100000}/part{product_id//1000}/{product_id}/images/big/1.webp",
+                    ])
+                    
+                    cache.set(cache_key, result, timeout=3600)
+                    return result
+                    
         except Exception as e:
-            logger.debug(f"Быстрый API запрос не удался для {product_id}: {str(e)}")
+            logger.error(f"Ошибка API запроса для {product_id}: {str(e)}")
         
         return []
     
@@ -833,14 +870,14 @@ class WildberriesParser:
     # Синхронные обертки
 
     @sync_timing_decorator
-    def parse_products(self, query: str, category: str = "", limit: int = 10) -> int:
+    def parse_products(self, query: str, limit: int = 10) -> int:
         """Алиас для parse_and_save"""
-        return self.parse_and_save(query, category, limit)
+        return self.parse_and_save(query, limit)
     
     @sync_timing_decorator
-    def parse_and_save(self, query: str, category: str = "", limit: int = 10) -> int:
+    def parse_and_save(self, query: str, limit: int = 10) -> int:
         """Синхронная обертка для обратной совместимости"""
-        return asyncio.run(self.parse_and_save_async(query, category, limit))
+        return asyncio.run(self.parse_and_save_async(query, limit))
     
     # Остальные
     
@@ -1098,7 +1135,6 @@ class WildberriesParser:
             'product_url': f"{self.base_url}/catalog/{product_id}/detail.aspx",
             'image_url': '',
             'images': [],
-            'category': '',
             'search_query': '',
             'brand': full_data.get('brand', '') if full_data else '',
             'description': full_data.get('description', '') if full_data else ''

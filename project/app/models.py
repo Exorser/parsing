@@ -59,13 +59,10 @@ class Product(models.Model):
         default=False,
         verbose_name="Есть изображения"
     )
-    category = models.CharField(
-        max_length=200, 
-        verbose_name="Категория"
-    )
     search_query = models.CharField(
         max_length=200, 
-        verbose_name="Поисковый запрос"
+        verbose_name="Поисковый запрос",
+        default=""
     )
     created_at = models.DateTimeField(
         default=timezone.now, 
@@ -90,7 +87,6 @@ class Product(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['product_id']),
-            models.Index(fields=['category']),
             models.Index(fields=['search_query']),
             models.Index(fields=['has_wb_card_discount']),
             models.Index(fields=['has_wb_card_payment']),
@@ -98,7 +94,7 @@ class Product(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.name[:50]} - {self.price}₽"
+        return f"{self.name} ({self.product_id})"
     
     def image_tag(self):
         if self.images.exists():
