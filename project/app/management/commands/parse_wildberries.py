@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
-from app.parser import WildberriesParser
+from Wildberries_parser.project.app.wildberries_parser import WildberriesParser
 
 class Command(BaseCommand):
     help = 'Парсинг товаров с Wildberries по заданному запросу'

@@ -12,8 +12,8 @@ from rest_framework.views import APIView
 import json
 import os
 
-from .models import Product, ProductImage
-from .parser import WildberriesParser
+from .models import Product
+from .wildberries_parser import WildberriesParser
 from .serializers import ProductSerializer
 
 

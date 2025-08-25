@@ -11,7 +11,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
-from app.parser import WildberriesParser
+from app.wildberries_parser import WildberriesParser
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import aiohttp
