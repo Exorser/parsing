@@ -13,7 +13,7 @@ import json
 import os
 
 from .models import Product
-from .wildberries_parser import WildberriesParser
+from .base_parser import WildberriesParser
 from .serializers import ProductSerializer
 
 

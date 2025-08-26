@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import requests
 from typing import List, Optional, Tuple
 from django.core.management.base import BaseCommand
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -11,30 +12,86 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler
 )
-from app.wildberries_parser import WildberriesParser
+from app.base_parser import WildberriesParser, OzonParser
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import aiohttp
+from datetime import datetime
+import sys
+from logging.handlers import RotatingFileHandler
 
 class IgnoreUnicodeErrorsHandler(logging.StreamHandler):
     def emit(self, record):
         try:
             super().emit(record)
         except UnicodeEncodeError:
-            pass  # Просто игнорируем ошибки Unicode
+            pass
 
+def setup_logging():
+    """Настройка комплексного логирования"""
+    # Создаем форматтер
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Настройка корневого логгера
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Удаляем существующие обработчики
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Консольный вывод
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    # Файловый вывод с ротацией
+    file_handler = RotatingFileHandler(
+        'telegram_bot.log',
+        maxBytes=10*1024*1024,  # 10 MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Обработчик для ошибок
+    error_handler = logging.FileHandler('telegram_errors.log', encoding='utf-8')
+    error_handler.setFormatter(formatter)
+    error_handler.setLevel(logging.ERROR)
+    
+    # Добавляем обработчики
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(error_handler)
+    
+    # Устанавливаем уровень для specific логгеров
+    logging.getLogger('telegram').setLevel(logging.WARNING)
+    logging.getLogger('apscheduler').setLevel(logging.WARNING)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    
+    return root_logger
+
+setup_logging()
 # Настройка логгера
 logger = logging.getLogger(__name__)
 logger.addHandler(IgnoreUnicodeErrorsHandler())
 logger.setLevel(logging.INFO)
 
 # Состояния для ConversationHandler
-SEARCH_QUERY, SEARCH_CATEGORY, SEARCH_LIMIT = range(3)
+SEARCH_QUERY, SEARCH_PLATFORM, SEARCH_LIMIT = range(3)
 
-class WildberriesBot:
+class MultiPlatformBot:
     def __init__(self, token: str):
         self.token = token
-        self.parser = WildberriesParser()
+        self.parsers = {
+            'WB': WildberriesParser(),
+            'OZ': OzonParser()
+        }
+        self.current_parser = self.parsers['WB']  # По умолчанию Wildberries
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.session = None
     
@@ -52,11 +109,19 @@ class WildberriesBot:
     def _get_main_keyboard(self):
         """Основная клавиатура с кнопками"""
         keyboard = [
-            [KeyboardButton("🔍 Поиск товаров")],
+            [KeyboardButton("🔍 Поиск товаров"), KeyboardButton("🛒 Сменить платформу")],
             [KeyboardButton("🔄 История поиска"), KeyboardButton("ℹ️ Помощь")],
             [KeyboardButton("🎯 Топ товаров"), KeyboardButton("💎 Акции")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите действие...")
+
+    def _get_platform_keyboard(self):
+        """Клавиатура для выбора платформы"""
+        keyboard = [
+            [KeyboardButton("Wildberries 🛍️"), KeyboardButton("Ozon 🟠")],
+            [KeyboardButton("↩️ Назад в меню")]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     def _get_search_keyboard(self):
         """Клавиатура для поиска"""
@@ -68,19 +133,74 @@ class WildberriesBot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите количество...")
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Инициализируем данные пользователя
+        context.user_data.setdefault('search_history', [])
+        context.user_data.setdefault('preferred_platform', 'WB')
+        
         welcome_text = (
-            "🎉 <b>Добро пожаловать в Wildberries Bot!</b>\n\n"
-            "Я помогу вам найти лучшие товары на Wildberries.\n\n"
+            "🎉 <b>Добро пожаловать в MultiPlatform Parser Bot!</b>\n\n"
+            "Я помогу вам найти лучшие товары на разных маркетплейсах.\n\n"
+            f"📦 <b>Текущая платформа:</b> {self._get_platform_display_name()}\n\n"
             "✨ <b>Как пользоваться:</b>\n"
             "• Используйте <b>кнопки меню</b> ниже\n"
-            "• Или введите <b>название товара</b> для поиска\n"
+            "• Или введите <b>название товара</b> для быстрого поиска\n"
             "• Команда <code>/help</code> - список всех команд\n\n"
-            "❌ <b>Не поддерживается:</b> файлы, фото, видео, геопозиция\n\n"
             "💡 <b>Начните с кнопок меню или введите товар для поиска!</b>"
         )
         
         await update.message.reply_text(
             welcome_text, 
+            parse_mode="HTML",
+            reply_markup=self._get_main_keyboard()
+        )
+
+    def _get_platform_display_name(self) -> str:
+        """Возвращает отображаемое имя текущей платформы"""
+        if isinstance(self.current_parser, WildberriesParser):
+            return "Wildberries 🛍️"
+        elif isinstance(self.current_parser, OzonParser):
+            return "Ozon 🟠"
+        return "Неизвестно"
+
+    async def switch_platform(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик смены платформы"""
+        await update.message.reply_text(
+            "🛒 <b>Выберите платформу для поиска:</b>\n\n"
+            "• Wildberries 🛍️ - российский маркетплейс\n"
+            "• Ozon 🟠 - одна из крупнейших площадок\n\n"
+            "💡 Вы можете менять платформу в любое время!",
+            parse_mode="HTML",
+            reply_markup=self._get_platform_keyboard()
+        )
+
+    async def handle_platform_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка выбора платформы"""
+        text = update.message.text.strip()
+        
+        if text == "Wildberries 🛍️":
+            self.current_parser = self.parsers['WB']
+            context.user_data['preferred_platform'] = 'WB'
+            platform_name = "Wildberries 🛍️"
+        elif text == "Ozon 🟠":
+            self.current_parser = self.parsers['OZ']
+            context.user_data['preferred_platform'] = 'OZ'
+            platform_name = "Ozon 🟠"
+        elif text == "↩️ Назад в меню":
+            await update.message.reply_text(
+                "Возвращаемся в главное меню...",
+                reply_markup=self._get_main_keyboard()
+            )
+            return
+        else:
+            await update.message.reply_text(
+                "❌ Неизвестная платформа",
+                reply_markup=self._get_platform_keyboard()
+            )
+            return
+        
+        await update.message.reply_text(
+            f"✅ <b>Платформа изменена на:</b> {platform_name}\n\n"
+            "Теперь все поиски будут выполняться на выбранной платформе.",
             parse_mode="HTML",
             reply_markup=self._get_main_keyboard()
         )
@@ -95,14 +215,14 @@ class WildberriesBot:
             "• /search - расширенный поиск товаров\n"
             "• /history - история ваших запросов\n"
             "• /top - топ товаров по категориям\n"
+            "• /platform - сменить платформу\n"
             "• /help - показать это сообщение\n\n"
             
-            "⚡ <b>Быстрые действия:</b>\n"
-            "• Просто напишите название товара для быстрого поиска!\n"
-            "• Используйте кнопки ниже для удобной навигации\n\n"
+            f"📦 <b>Текущая платформа:</b> {self._get_platform_display_name()}\n\n"
             
             "💎 <b>Доступные кнопки:</b>\n"
             "• 🔍 Поиск товаров - расширенный поиск\n"
+            "• 🛒 Сменить платформу - выбор маркетплейса\n"
             "• 🔄 История поиска - ваши прошлые запросы\n"
             "• 🎯 Топ товаров - популярные категории\n"
             "• 💎 Акции - товары со скидками\n\n"
@@ -112,32 +232,6 @@ class WildberriesBot:
         
         await update.message.reply_text(
             help_text, 
-            parse_mode="HTML",
-            reply_markup=self._get_main_keyboard()
-        )
-    
-    async def commands_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Отдельная команда для списка всех доступных команд"""
-        commands_text = (
-            "⌨️ <b>ДОСТУПНЫЕ КОМАНДЫ</b>\n\n"
-            
-            "<b>Текстовые команды:</b>\n"
-            "<code>/start</code> - начать работу\n"
-            "<code>/search</code> - расширенный поиск\n"
-            "<code>/history</code> - история\n"
-            "<code>/top</code> - топ товаров\n"
-            "<code>/help</code> - помощь\n"
-            "<code>/commands</code> - этот список\n\n"
-            
-            "<b>Быстрый поиск:</b>\n"
-            "Просто напишите название товара в чат!\n\n"
-            
-            "<b>Кнопки меню:</b>\n"
-            "Используйте кнопки ниже для быстрой навигации"
-        )
-        
-        await update.message.reply_text(
-            commands_text,
             parse_mode="HTML",
             reply_markup=self._get_main_keyboard()
         )
@@ -171,9 +265,16 @@ class WildberriesBot:
         """Обработчик текстовых сообщений с кнопками"""
         text = update.message.text.strip()
         
-        # Сначала проверяем ВСЕ возможные кнопки
+        # Обработка выбора платформы
+        if text in ["Wildberries 🛍️", "Ozon 🟠"]:
+            await self.handle_platform_selection(update, context)
+            return
+        
+        # Обработка остальных кнопок
         if text == "🔍 Поиск товаров":
             await self.search_command(update, context)
+        elif text == "🛒 Сменить платформу":
+            await self.switch_platform(update, context)
         elif text == "📊 Статистика":
             await self.stats_command(update, context)
         elif text == "🔄 История поиска":
@@ -197,26 +298,19 @@ class WildberriesBot:
             await self.handle_confirmation(update, context)
         elif text == "❌ Нет, отменить":
             await self.handle_confirmation(update, context)
-        elif text == "↩️ Назад в меню":
-            await self.history_command(update, context)
         elif context.user_data.get('awaiting_confirmation', False):
-            # Если ждем подтверждения очистки
             await self.handle_confirmation(update, context)
         elif text.startswith("🔍 ") and len(text) > 2:
-            # Обработка клика по истории поиска
             query = text[2:].strip()
             await self.show_history_products(update, context, query)
         else:
-            # Если это не кнопка, проверяем состояние разговора
             if context.user_data.get('in_search', False):
-                # Если мы в процессе поиска, передаем управление соответствующим обработчикам
                 current_state = context.user_data.get('search_state')
                 if current_state == SEARCH_QUERY:
                     await self.receive_query(update, context)
                 elif current_state == SEARCH_LIMIT:
                     await self.receive_limit(update, context)
             else:
-                # Обычный текстовый запрос - быстрый поиск
                 await self.quick_search(update, context)
     
     async def clear_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -370,7 +464,7 @@ class WildberriesBot:
         
         # Используем стратегию для бесплатного бота
         products = await asyncio.to_thread(
-            self.parser.search_products_with_strategy,
+            self.current_parser.search_products_with_strategy,
             query,
             limit=5,
             strategy="popular_midrange"
@@ -439,13 +533,19 @@ class WildberriesBot:
         )
 
     async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Начало процесса поиска"""
+        platform_name = self._get_platform_display_name()
+        
         await update.message.reply_text(
-            "🔍 <b>Расширенный поиск</b>\n\n"
+            f"🔍 <b>Расширенный поиск на {platform_name}</b>\n\n"
             "Введите название товара для поиска:",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("↩️ Назад в меню")]], 
                                         resize_keyboard=True)
         )
+        
+        context.user_data['in_search'] = True
+        context.user_data['search_state'] = SEARCH_QUERY
         return SEARCH_QUERY
     
     def _get_history_keyboard(self, search_history: list):
@@ -464,14 +564,15 @@ class WildberriesBot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     async def receive_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка поискового запроса"""
         text = update.message.text.strip()
         
-        # Проверяем, не является ли это кнопкой "Назад"
         if text == "↩️ Назад в меню":
             await update.message.reply_text(
                 "Возвращаемся в главное меню...",
                 reply_markup=self._get_main_keyboard()
             )
+            context.user_data['in_search'] = False
             return ConversationHandler.END
         
         query = text.strip()
@@ -481,7 +582,7 @@ class WildberriesBot:
         
         context.user_data['query'] = query
         
-        # Теперь предлагаем выбрать количество товаров
+        # Предлагаем выбрать количество товаров
         keyboard = [
             [KeyboardButton("5 товаров"), KeyboardButton("10 товаров")],
             [KeyboardButton("15 товаров"), KeyboardButton("20 товаров")],
@@ -489,22 +590,26 @@ class WildberriesBot:
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
+        platform_name = self._get_platform_display_name()
         await update.message.reply_text(
-            f"🔍 Вы ищете: <b>{query}</b>\n\nТеперь выберите количество товаров:",
+            f"🔍 Вы ищете на {platform_name}: <b>{query}</b>\n\nТеперь выберите количество товаров:",
             parse_mode="HTML",
             reply_markup=reply_markup
         )
+        
+        context.user_data['search_state'] = SEARCH_LIMIT
         return SEARCH_LIMIT
 
     async def receive_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка выбора количества товаров"""
         text = update.message.text.strip()
 
         if text not in ["5 товаров", "10 товаров", "15 товаров", "20 товаров"]:
-            # Если это не кнопка количества, возвращаемся к обработке сообщений
             await self.handle_message(update, context)
+            context.user_data['in_search'] = False
             return ConversationHandler.END
         
-        # Обрабатываем кнопки количества товаров
+        # Определяем лимит
         if text == "5 товаров":
             limit = 5
         elif text == "10 товаров":
@@ -513,90 +618,73 @@ class WildberriesBot:
             limit = 15
         elif text == "20 товаров":
             limit = 20
-        elif text == "↩️ Назад в меню":
-            await update.message.reply_text(
-                "Возвращаемся к выбору категории...",
-                reply_markup=self._get_search_keyboard()
-            )
-            return SEARCH_QUERY
         else:
-            try:
-                limit = int(text)
-                if limit < 1 or limit > 20:
-                    raise ValueError
-            except ValueError:
-                await update.message.reply_text("❌ Некорректное число. Введите число от 1 до 20.")
-                return SEARCH_LIMIT
+            await update.message.reply_text("❌ Некорректное число. Введите число от 1 до 20.")
+            return SEARCH_LIMIT
         
         query = context.user_data['query']
+        platform_name = self._get_platform_display_name()
         
         search_msg = await update.message.reply_text(
-            f"🔍 <b>Ищу {limit} товаров по запросу:</b> <code>{query}</code>\n\n"
+            f"🔍 <b>Ищу {limit} товаров на {platform_name} по запросу:</b> <code>{query}</code>\n\n"
             "⏳ Это может занять несколько секунд...",
             parse_mode="HTML"
         )
         
         try:
-            # Используем новый метод search_products
-            products_data = await asyncio.to_thread(self.parser.search_products, query, limit)
+            # Используем текущий парсер для поиска
+            products_data = await asyncio.to_thread(self.current_parser.search_products, query, limit)
             
             if not products_data:
                 await search_msg.edit_text(
-                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено</b>\n\n"
-                    "💡 Попробуйте изменить запрос",
+                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
+                    "💡 Попробуйте изменить запрос или сменить платформу",
                     parse_mode="HTML"
                 )
+                context.user_data['in_search'] = False
                 return ConversationHandler.END
             
-            # Сохраняем товары асинхронно
-            saved_count = await self.parser.parse_and_save_async(query, limit)
+            # Сохраняем товары
+            saved_count = await self.current_parser.parse_and_save_async(query, limit)
             
             if saved_count == 0:
                 await search_msg.edit_text(
-                    "❌ <b>Не удалось сохранить товары</b>\n\n"
+                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
                     "⚠️ Попробуйте другой запрос",
                     parse_mode="HTML"
                 )
+                context.user_data['in_search'] = False
                 return ConversationHandler.END
             
-            # Получаем сохраненные товары из базы ПО ID
+            # Получаем сохраненные товары из базы
             from app.models import Product
             
-            # Получаем ID из products_data
             product_ids = [str(p.get('product_id')) for p in products_data if p.get('product_id')]
-            logger.info("Ищем товары с ID: %s", product_ids)
             
             if product_ids:
                 products = await asyncio.to_thread(
-                    lambda: list(Product.objects.filter(product_id__in=product_ids))
+                    lambda: list(Product.objects.filter(
+                        product_id__in=product_ids, 
+                        platform=self.current_parser.platform
+                    ))
                 )
-                logger.info("Найдено в базе: %s товаров", len(products))
             else:
-                # Fallback: берем последние товары
                 products = await asyncio.to_thread(
-                    lambda: list(Product.objects.all().order_by('-id')[:limit])
+                    lambda: list(Product.objects.filter(
+                        platform=self.current_parser.platform
+                    ).order_by('-id')[:limit])
                 )
-                logger.info("Взяли последние: %s товаров", len(products))
             
-            # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
-            if products:
-                for p in products:
-                    logger.info("Товар для отправки: %s - %s (image: %s)", 
-                            p.product_id, p.name, bool(p.image_url))
-            else:
-                logger.warning("Нет товаров для отправки!")
-            
-            # Сохраняем в context для статистики
             context.user_data['last_results'] = products
             context.user_data['query'] = query
             
             await search_msg.edit_text(
-                f"✅ <b>Найдено и сохранено {saved_count} товаров</b>\n\n"
+                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
                 "📦 Отправляю результаты...",
                 parse_mode="HTML"
             )
             
-            # ПРЕОБРАЗУЕМ ДЛЯ ОТПРАВКИ
+            # Преобразуем для отправки
             products_for_sending = []
             for product in products:
                 products_for_sending.append({
@@ -609,26 +697,25 @@ class WildberriesBot:
                     'product_url': product.product_url,
                     'image_url': product.image_url,
                     'quantity': product.quantity,
-                    'is_available': product.is_available
+                    'is_available': product.is_available,
+                    'platform': product.platform
                 })
             
-            logger.info("Подготовлено для отправки: %s товаров", len(products_for_sending))
+            # Сохраняем историю поиска
+            await self._save_search_history(context, query, products_for_sending, platform_name)
             
-            # СОХРАНЯЕМ ИСТОРИЮ ПОИСКА
-            await self._save_search_history(context, query, products_for_sending)
-            
-            # ОТПРАВЛЯЕМ ТОВАРЫ
+            # Отправляем товары
             await self.send_all_products(update, products_for_sending)
             
         except Exception as e:
             logger.error("Ошибка поиска: %s", str(e), exc_info=True)
             await search_msg.edit_text(
-                "⚠️ <b>Произошла ошибка при поиске</b>\n\n"
+                f"⚠️ <b>Произошла ошибка при поиске на {platform_name}</b>\n\n"
                 "🔧 Пожалуйста, попробуйте позже",
                 parse_mode="HTML"
             )
-            return ConversationHandler.END  # Добавляем возврат здесь
         
+        context.user_data['in_search'] = False
         await update.message.reply_text(
             "🎉 <b>Поиск завершен!</b>\n\n"
             "💡 Используйте кнопки для новых запросов:",
@@ -638,24 +725,17 @@ class WildberriesBot:
         return ConversationHandler.END
 
     async def quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
+        """Быстрый поиск по введенному тексту"""
         query = update.message.text.strip()
-        text = update.message.text.strip()
-    
-        # ПРОВЕРЯЕМ ЧТО ЭТО НЕ КНОПКА
-        if text in ["↩️ Назад", "↩️ Назад в меню", "🔄 Вернуться к истории", 
-                    "✅ Да, очистить историю", "❌ Нет, отменить"]:
-            # Если это кнопка, а не поисковый запрос
-        
-            logger.info("Быстрый поиск по запросу: '%s'", text)
-            logger.info("Быстрый поиск по запросу: '%s'", query)
         
         if len(query) < 2:
             await update.message.reply_text("❌ Слишком короткий запрос. Попробуйте еще раз.")
             return
         
+        platform_name = self._get_platform_display_name()
+        
         search_msg = await update.message.reply_text(
-            f"🔍 <b>Ищу товары по запросу:</b> <code>{query}</code>\n\n"
+            f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>\n\n"
             "⏳ Это может занять несколько секунд...",
             parse_mode="HTML"
         )
@@ -666,7 +746,7 @@ class WildberriesBot:
             for i in range(3):
                 try:
                     await search_msg.edit_text(
-                        f"🔍 <b>Ищу товары по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
+                        f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
                         "⏳ Это может занять несколько секунд...",
                         parse_mode="HTML"
                     )
@@ -675,32 +755,30 @@ class WildberriesBot:
                 await asyncio.sleep(0.5)
             
             # Ищем товары
-            raw_products = await asyncio.to_thread(self.parser.search_products, query, 10)
-            logger.info("Получено %s сырых товаров", len(raw_products))
+            raw_products = await asyncio.to_thread(self.current_parser.search_products, query, 10)
             
             if not raw_products:
                 await search_msg.edit_text(
-                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено</b>\n\n"
-                    "💡 Попробуйте изменить запрос",
+                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
+                    "💡 Попробуйте изменить запрос или сменить платформу",
                     parse_mode="HTML"
                 )
                 return
             
             # Сохраняем товары
-            saved_count = await self.parser.parse_and_save_async(query, 10)
+            saved_count = await self.current_parser.parse_and_save_async(query, 10)
             
             if saved_count == 0:
                 await search_msg.edit_text(
-                    "❌ <b>Не удалось сохранить товары</b>\n\n"
+                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
                     "⚠️ Попробуйте другой запрос",
                     parse_mode="HTML"
                 )
                 return
             
-            # ПОЛУЧАЕМ ТОВАРЫ ИЗ БАЗЫ ПРАВИЛЬНО
+            # Получаем товары из базы
             from app.models import Product
             
-            # Вариант 1: По ID из сырых данных
             product_ids = []
             for p in raw_products:
                 pid = p.get('product_id')
@@ -709,34 +787,31 @@ class WildberriesBot:
             
             if product_ids:
                 products = await asyncio.to_thread(
-                    lambda: list(Product.objects.filter(product_id__in=product_ids))
+                    lambda: list(Product.objects.filter(
+                        product_id__in=product_ids, 
+                        platform=self.current_parser.platform
+                    ))
                 )
-                logger.info("Найдено по ID: %s товаров", len(products))
             else:
-                # Вариант 2: Последние товары
                 products = await asyncio.to_thread(
-                    lambda: list(Product.objects.all().order_by('-id')[:10])
+                    lambda: list(Product.objects.filter(
+                        platform=self.current_parser.platform
+                    ).order_by('-id')[:10])
                 )
-                logger.info("Найдено последних: %s товаров", len(products))
             
             if not products:
                 await search_msg.edit_text(
-                    "❌ <b>Не удалось загрузить товары из базы</b>\n\n"
+                    f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
                     "⚠️ Попробуйте еще раз",
                     parse_mode="HTML"
                 )
                 return
             
-            # Отладочная информация
-            logger.info("Товары для отправки: %s", len(products))
-            for p in products:
-                logger.info(" - %s: %s", p.product_id, p.name)
-            
             context.user_data['last_results'] = products
             context.user_data['query'] = query
             
             await search_msg.edit_text(
-                f"✅ <b>Найдено и сохранено {saved_count} товаров</b>\n\n"
+                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
                 "📦 Отправляю результаты...",
                 parse_mode="HTML"
             )
@@ -754,11 +829,12 @@ class WildberriesBot:
                     'product_url': product.product_url,
                     'image_url': product.image_url,
                     'quantity': product.quantity,
-                    'is_available': product.is_available
+                    'is_available': product.is_available,
+                    'platform': product.platform
                 })
             
-            # ТЕПЕРЬ СОХРАНЯЕМ ИСТОРИЮ ПОСЛЕ ТОГО КАК products_for_sending СОЗДАН
-            await self._save_search_history(context, query, products_for_sending)
+            # Сохраняем историю поиска
+            await self._save_search_history(context, query, products_for_sending, platform_name)
             
             # Отправляем товары
             await self.send_all_products(update, products_for_sending)
@@ -766,7 +842,7 @@ class WildberriesBot:
         except Exception as e:
             logger.error("Ошибка поиска: %s", str(e), exc_info=True)
             await search_msg.edit_text(
-                "⚠️ <b>Произошла ошибка при поиске</b>\n\n"
+                f"⚠️ <b>Произошла ошибка при поиске на {platform_name}</b>\n\n"
                 "🔧 Пожалуйста, попробуйте позже",
                 parse_mode="HTML"
             )
@@ -827,7 +903,6 @@ class WildberriesBot:
             
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка проверки базы: {str(e)}")
-
 
     async def _is_image_available(self, image_url: str) -> bool:
         """Проверка доступности изображения"""
@@ -922,7 +997,7 @@ class WildberriesBot:
                 
             # Получаем все возможные URL изображений через парсер
             image_urls = await asyncio.to_thread(
-                self.parser._generate_all_image_urls, 
+                self.current_parser._generate_all_image_urls, 
                 int(product_id)
             )
             
@@ -1010,31 +1085,34 @@ class WildberriesBot:
             logger.error(f"Ошибка отправки текстовой версии: {e}")
 
     def _generate_caption(self, product: dict, current_index: int, total_count: int) -> str:
-        """Генерация красивой подписи для товара"""
+        """Генерация подписи для товара с учетом платформы"""
         name = product.get('name', 'Без названия')
         price = product.get('price', 0)
         discount_price = product.get('discount_price')
-        wb_card_price = product.get('wildberries_card_price')
         rating = product.get('rating', 0)
         reviews = product.get('reviews_count', 0)
         product_url = product.get('product_url', '')
-        has_wb_card_discount = product.get('has_wb_card_discount', False)
         product_id = product.get('product_id', 'N/A')
         quantity = product.get('quantity', 0)
         is_available = product.get('is_available', False)
+        platform = product.get('platform', 'WB')
+        
+        # Определяем эмодзи платформы
+        platform_emoji = "🛍️" if platform == 'WB' else "🟠"
+        platform_name = "Wildberries" if platform == 'WB' else "Ozon"
         
         # Форматируем цены
         price_str = f"<b>{price:,.0f} ₽</b>".replace(',', ' ')
         
-        # Создаем красивый текст
-        text = f"🏷️ <b>{name}</b>\n\n"
+        # Создаем текст
+        text = f"{platform_emoji} <b>{name}</b>\n\n"
         
-        # Блок с артикулом
+        # Блок с артикулом и платформой
         text += f"📋 <b>Артикул:</b> <code>{product_id}</code>\n"
+        text += f"🏪 <b>Платформа:</b> {platform_name} {platform_emoji}\n"
         
         # Блок с ценами
         if discount_price and discount_price < price:
-            # Товар со скидкой
             discount_percent = int((1 - discount_price / price) * 100)
             discount_price_str = f"<b>{discount_price:,.0f} ₽</b>".replace(',', ' ')
             original_price_str = f"<s>{price:,.0f} ₽</s>".replace(',', ' ')
@@ -1042,17 +1120,8 @@ class WildberriesBot:
             text += f"💰 <b>Цена:</b> {discount_price_str}\n"
             text += f"📉 <b>Было:</b> {original_price_str}\n"
             text += f"🎯 <b>Скидка:</b> <b>-{discount_percent}%</b>\n"
-            
-            if has_wb_card_discount and wb_card_price:
-                wb_card_str = f"<b>{wb_card_price:,.0f} ₽</b>".replace(',', ' ')
-                text += f"💳 <b>По карте WB:</b> {wb_card_str}\n"
-                
         else:
-            # Обычная цена
             text += f"💰 <b>Цена:</b> {price_str}\n"
-            if has_wb_card_discount and wb_card_price:
-                wb_card_str = f"<b>{wb_card_price:,.0f} ₽</b>".replace(',', ' ')
-                text += f"💳 <b>По карте WB:</b> {wb_card_str}\n"
 
         text += "\n"
         
@@ -1067,7 +1136,7 @@ class WildberriesBot:
         else:
             text += "📝 <b>Отзывов:</b> пока нет\n"
         
-        # Блок с наличием товара - УПРОЩЕННАЯ ЛОГИКА
+        # Блок с наличием
         if quantity is not None and quantity > 0:
             text += f"📦 <b>В наличии:</b> {quantity} шт.\n"
         elif is_available:
@@ -1077,22 +1146,19 @@ class WildberriesBot:
         
         # Блок с навигацией и ссылкой
         text += f"🔢 <b>Товар {current_index + 1} из {total_count}</b>\n"
-        text += f"🔗 <a href='{product_url}'>Перейти к товару на Wildberries</a>\n\n"
+        text += f"🔗 <a href='{product_url}'>Перейти к товару на {platform_name}</a>\n\n"
         
         # Добавляем хештеги
-        hashtags = ["#wildberries"]
+        hashtags = [f"#{platform_name.lower()}"]
         if discount_price and discount_price < price:
             hashtags.append("#скидка")
-        if has_wb_card_discount:
-            hashtags.append("#картаWB")
         
         text += " ".join(hashtags)
         
         # Обрезаем если слишком длинный
         if len(text) > 1024:
-            # Сохраняем самое важное
             important_parts = [
-                f"🏷️ <b>{name}</b>\n\n",
+                f"{platform_emoji} <b>{name}</b>\n\n",
                 f"📋 <b>Артикул:</b> <code>{product_id}</code>\n",
                 f"💰 <b>Цена:</b> {price_str}\n",
                 f"📦 <b>В наличии:</b> {quantity} шт.\n" if quantity and quantity > 0 else "✅ <b>В наличии</b>\n",
@@ -1175,18 +1241,17 @@ class WildberriesBot:
         )
 
     async def history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Красивый показ истории поиска"""
+        """Показ истории поиска с информацией о платформах"""
         search_history = context.user_data.get('search_history', [])
-    
-        # Фильтруем историю - убираем записи с командами вместо запросов
+        
+        # Фильтруем историю
         filtered_history = []
         for item in search_history:
             query = item.get('query', '')
-            # Пропускаем записи где query это команда
             if query not in ["🔄 Вернуться к истории", "✅ Да, очистить историю", "❌ Нет, отменить"]:
                 filtered_history.append(item)
         
-        context.user_data['search_history'] = filtered_history[:15]  # Обновляем историю
+        context.user_data['search_history'] = filtered_history[:15]
         
         if not filtered_history:
             await update.message.reply_text(
@@ -1197,45 +1262,44 @@ class WildberriesBot:
             )
             return
         
-        if not search_history:
-            await update.message.reply_text(
-                "📝 <b>История поиска пуста</b>\n\n"
-                "🔍 Выполните поиск товаров, чтобы сохранить историю запросов",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
-            return
-        
-        # Сортируем историю по времени (новые сначала)
-        sorted_history = sorted(search_history, 
+        # Сортируем историю по времени
+        sorted_history = sorted(filtered_history, 
                             key=lambda x: x.get('timestamp', ''), 
                             reverse=True)
         
-        # Формируем красивый текст
+        # Формируем текст
         text = "✨ <b>ИСТОРИЯ ПОИСКА</b>\n\n"
         
-        for i, history_item in enumerate(sorted_history[:10], 1):  # Последние 10 запросов
+        for i, history_item in enumerate(sorted_history[:10], 1):
             query = history_item.get('query', 'Неизвестно')
             timestamp = history_item.get('timestamp', '')
             count = history_item.get('results_count', 0)
+            platform = history_item.get('platform', 'Неизвестно')
+            
+            platform_emoji = "🛍️" if platform == 'Wildberries 🛍️' or platform == 'WB' else "🟠"
+            platform_name = "Wildberries" if platform == 'Wildberries 🛍️' or platform == 'WB' else "Ozon"
             
             text += f"🔍 <b>Запрос {i}:</b> <code>{query}</code>\n"
             text += f"   📦 Найдено товаров: <b>{count}</b>\n"
+            text += f"   🏪 Платформа: {platform_name} {platform_emoji}\n"
             text += f"   🕒 Время: {timestamp}\n"
             
-            # Добавляем разделитель между запросами
             if i < min(10, len(sorted_history)):
                 text += "   ───────────────────\n"
             text += "\n"
         
         text += "💡 <i>Нажмите на запрос ниже чтобы посмотреть товары</i>"
         
-        # Создаем клавиатуру с кнопками запросов
+        # Создаем клавиатуру
         keyboard = []
-        for history_item in sorted_history[:5]:  # Первые 5 запросов
+        for history_item in sorted_history[:5]:
             query = history_item.get('query', '')
-            # Обрезаем длинные запросы
-            display_query = query[:18] + "..." if len(query) > 21 else query
+            platform = history_item.get('platform', '')
+            
+            platform_emoji = "🛍️" if platform == 'Wildberries 🛍️' or platform == 'WB' else "🟠"
+            display_query = query[:15] + "..." if len(query) > 18 else query
+            button_text = f"{platform_emoji} {display_query}"
+            
             keyboard.append([KeyboardButton(f"🔍 {display_query}")])
         
         keyboard.append([KeyboardButton("🧹 Очистить историю")])
@@ -1249,40 +1313,46 @@ class WildberriesBot:
             reply_markup=reply_markup
         )
 
-    async def _save_search_history(self, context: ContextTypes.DEFAULT_TYPE, query: str, products: list):
-        """Сохранение истории поиска с проверкой"""
-        # Проверяем что query не является командой
+    async def _save_search_history(self, context: ContextTypes.DEFAULT_TYPE, query: str, 
+                                 products: list, platform_name: str):
+        """Сохранение истории поиска с информацией о платформе"""
         if query in ["🔄 Вернуться к истории", "✅ Да, очистить историю", "❌ Нет, отменить"]:
-            return  # Не сохраняем команды в историю
+            return
         
         if 'search_history' not in context.user_data:
             context.user_data['search_history'] = []
         
         history = context.user_data['search_history']
         
-        # Форматируем время
-        from datetime import datetime
         timestamp = datetime.now().strftime("%d.%m.%Y в %H:%M")
         
-        # Удаляем старые записи с таким же запросом
-        history = [item for item in history if item.get('query') != query]
+        # Удаляем старые записи с таким же запросом и платформой
+        history = [item for item in history if not (
+            item.get('query') == query and item.get('platform') == platform_name
+        )]
         
         # Добавляем новую запись
         history.insert(0, {
             'query': query,
             'results_count': len(products),
             'products': products[:10],
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'platform': platform_name
         })
         
-        # Ограничиваем историю 15 записями
+        # Ограничиваем историю
         context.user_data['search_history'] = history[:30]
+
+    async def platform_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Команда для смены платформы"""
+        await self.switch_platform(update, context)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "❌ Поиск отменен.",
             reply_markup=self._get_main_keyboard()
         )
+        context.user_data['in_search'] = False
         return ConversationHandler.END
 
     async def debug_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1310,7 +1380,7 @@ class WildberriesBot:
         if not is_available:
             # Ищем альтернативные изображения
             alternative_urls = await asyncio.to_thread(
-                self.parser._generate_all_image_urls, 
+                self.current_parser._generate_all_image_urls, 
                 int(product_id) if product_id.isdigit() else 0
             )
             
@@ -1389,6 +1459,66 @@ class WildberriesBot:
         )
         
         await update.message.reply_text(solution_text, parse_mode="HTML")
+    
+    async def debug_ozon(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Отладочная команда для проверки Ozon"""
+        test_queries = ["телефон", "ноутбук", "кроссовки", "книга"]
+        
+        for query in test_queries:
+            await update.message.reply_text(f"🔍 Тестируем Ozon по запросу: {query}")
+            
+            try:
+                products = await asyncio.to_thread(self.parsers['OZ'].search_products, query, 3)
+                
+                if products:
+                    await update.message.reply_text(
+                        f"✅ Успешно! Найдено {len(products)} товаров\n"
+                        f"Пример: {products[0].get('name', 'Без названия')}"
+                    )
+                else:
+                    await update.message.reply_text("❌ Товары не найдены")
+                    
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            
+            await asyncio.sleep(1)
+    
+    async def check_ozon_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Проверка доступности Ozon API"""
+        try:
+            test_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
+            payload = {
+                "url": "/search/?text=телефон",
+                "params": {"text": "телефон"}
+            }
+            
+            response = requests.post(
+                test_url,
+                json=payload,
+                headers={
+                    'User-Agent': self.ua.random,
+                    'Content-Type': 'application/json',
+                    'Origin': 'https://www.ozon.ru',
+                    'Referer': 'https://www.ozon.ru/'
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                await update.message.reply_text(
+                    f"✅ Ozon API доступен\n"
+                    f"Status: {response.status_code}\n"
+                    f"Response: {response.text[:200]}..."
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Ozon API недоступен\n"
+                    f"Status: {response.status_code}\n"
+                    f"Response: {response.text[:200]}..."
+                )
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка проверки Ozon API: {str(e)}")
 
 class Command(BaseCommand):
     help = 'Запускает Telegram бота для парсинга Wildberries'
@@ -1396,7 +1526,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         token = "8124289862:AAGPVxgf5gyphHU1SUwVfgozwbEL9a1NO24"
         
-        bot = WildberriesBot(token)
+        bot = MultiPlatformBot(token)
         application = Application.builder().token(token).build()
         
         # Добавляем обработчики команд
@@ -1404,6 +1534,7 @@ class Command(BaseCommand):
         application.add_handler(CommandHandler("help", bot.help))
         application.add_handler(CommandHandler("stats", bot.stats_command))
         application.add_handler(CommandHandler("history", bot.history_command))
+        application.add_handler(CommandHandler("platform", bot.platform_command))
         application.add_handler(CommandHandler("debug", bot.debug_image))
         application.add_handler(CommandHandler("top", bot.top_products))
         application.add_handler(CommandHandler("debug_image", bot.debug_image))
@@ -1411,9 +1542,8 @@ class Command(BaseCommand):
         application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_media))
         application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, bot.handle_media))
         application.add_handler(MessageHandler(filters.LOCATION | filters.POLL, bot.handle_media))
-        application.add_handler(CommandHandler("commands", bot.commands_list))
-        # Добавляем ConversationHandler для поиска
-        # Добавляем ConversationHandler для поиска
+     
+         # Добавляем ConversationHandler для поиска
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("search", bot.search_command),
@@ -1424,13 +1554,13 @@ class Command(BaseCommand):
                 SEARCH_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.receive_limit)],
             },
             fallbacks=[CommandHandler("cancel", bot.cancel)],
-)
+        )
         application.add_handler(conv_handler)
         
-        # Добавляем обработчик текстовых сообщений (кнопки и быстрый поиск)
+        # Добавляем обработчик текстовых сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
         
-        self.stdout.write(self.style.SUCCESS('Бот запущен и работает...'))
+        self.stdout.write(self.style.SUCCESS('Мультиплатформенный бот запущен и работает...'))
         
         # Создаем новое событийное loop для асинхронных операций
         loop = asyncio.new_event_loop()
