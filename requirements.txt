@@ -6,4 +6,5 @@ selenium
 webdriver-manager
 lxml
 fake-useragent
+urllib3==1.26.6
 djangorestframework==3.14.0

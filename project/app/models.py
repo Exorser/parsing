@@ -10,7 +10,7 @@ class Platform(models.TextChoices):
 class Product(models.Model):
     """Модель товара для обеих платформ"""
     platform = models.CharField(
-        max_length=2,
+        max_length=40,
         choices=Platform.choices,
         default=Platform.WILDBERRIES,
         verbose_name="Платформа"

@@ -94,17 +94,45 @@ class MultiPlatformBot:
         self.current_parser = self.parsers['WB']  # По умолчанию Wildberries
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.session = None
+        self.current_search_task = None  # Текущая задача поиска
+        self.search_lock = asyncio.Lock()
     
     async def init_session(self):
         """Инициализация сессии в асинхронном контексте"""
         if self.session is None:
             self.session = aiohttp.ClientSession()
+            
+        if hasattr(self.parsers['OZ'], 'init_session_async'):
+            await self.parsers['OZ'].init_session_async()
     
     async def close_session(self):
-        """Закрытие сессии"""
-        if self.session:
-            await self.session.close()
+        """Закрытие сессии и отмена всех задач"""
+        try:
+            # Отменяем текущий поиск
+            await self.cancel_current_search()
+            
+            # Закрываем сессии парсеров
+            for parser in self.parsers.values():
+                if hasattr(parser, 'close_session'):
+                    await parser.close_session()
+                elif hasattr(parser, 'session'):
+                    parser.session.close()
+            
+            # Закрываем основную сессию
+            if self.session:
+                await self.session.close()
+                self.session = None
+                
+            # Закрываем executor
+            self.executor.shutdown(wait=False)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии сессии: {e}")
+        finally:
+            # Гарантируем очистку
             self.session = None
+            async with self.search_lock:
+                self.current_search_task = None
 
     def _get_main_keyboard(self):
         """Основная клавиатура с кнопками"""
@@ -131,7 +159,45 @@ class MultiPlatformBot:
             [KeyboardButton("↩️ Назад в меню")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите количество...")
+
+    def _get_cancel_keyboard(self):
+        """Клавиатура только с кнопкой отмены поиска"""
+        keyboard = [
+            [KeyboardButton("❌ Отменить поиск")]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Поиск выполняется...")
+
+    def _get_quick_search_keyboard(self):
+        """Клавиатура для быстрого поиска с кнопкой отмены"""
+        keyboard = [
+            [KeyboardButton("❌ Отменить поиск")]
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Идет поиск...")
     
+    async def cancel_current_search(self):
+        """Мгновенная отмена текущего поиска"""
+        async with self.search_lock:
+            if self.current_search_task and not self.current_search_task.done():
+                self.current_search_task.cancel()
+                try:
+                    await asyncio.wait_for(self.current_search_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    logger.info("Поиск отменен")
+                except Exception as e:
+                    logger.error(f"Ошибка при отмене поиска: {e}")
+                finally:
+                    self.current_search_task = None
+
+    async def cancel_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработчик отмены поиска из состояния поиска"""
+        context.user_data['search_cancelled'] = True
+        await update.message.reply_text(
+            "❌ Поиск отменен.",
+            reply_markup=self._get_main_keyboard()
+        )
+        context.user_data['in_search'] = False
+        return ConversationHandler.END
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Инициализируем данные пользователя
         context.user_data.setdefault('search_history', [])
@@ -265,6 +331,35 @@ class MultiPlatformBot:
         """Обработчик текстовых сообщений с кнопками"""
         text = update.message.text.strip()
         
+        # Обработка кнопки отмены поиска
+        if text == "❌ Отменить поиск":
+            # Устанавливаем флаг отмены
+            context.user_data['search_cancelled'] = True
+            await update.message.reply_text(
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+            context.user_data['in_search'] = False
+            return
+        
+        # Обработка кнопки отмены быстрого поиска
+        if text == "❌ Отменить поиск" and context.user_data.get('in_quick_search', False):
+            context.user_data['quick_search_cancelled'] = True
+            await update.message.reply_text(
+                "❌ Быстрый поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+            context.user_data['in_quick_search'] = False
+            return
+        
+        if text == "❌ Отменить поиск":
+            await self.cancel_current_search()
+            await update.message.reply_text(
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+            return
+    
         # Обработка выбора платформы
         if text in ["Wildberries 🛍️", "Ozon 🟠"]:
             await self.handle_platform_selection(update, context)
@@ -581,6 +676,8 @@ class MultiPlatformBot:
             return SEARCH_QUERY
         
         context.user_data['query'] = query
+        context.user_data['search_cancelled'] = False  # Сбрасываем флаг отмены
+
         
         # Предлагаем выбрать количество товаров
         keyboard = [
@@ -588,8 +685,8 @@ class MultiPlatformBot:
             [KeyboardButton("15 товаров"), KeyboardButton("20 товаров")],
             [KeyboardButton("↩️ Назад в меню")]
         ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
+        reply_markup = self._get_search_keyboard()     
+
         platform_name = self._get_platform_display_name()
         await update.message.reply_text(
             f"🔍 Вы ищете на {platform_name}: <b>{query}</b>\n\nТеперь выберите количество товаров:",
@@ -601,212 +698,203 @@ class MultiPlatformBot:
         return SEARCH_LIMIT
 
     async def receive_limit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Обработка выбора количества товаров"""
+        """Обработка выбора количества товаров с мгновенной отменой"""
         text = update.message.text.strip()
 
-        if text not in ["5 товаров", "10 товаров", "15 товаров", "20 товаров"]:
-            await self.handle_message(update, context)
+        # Обработка кнопки возврата в меню
+        if text == "↩️ Назад в меню":
+            await update.message.reply_text(
+                "Возвращаемся в главное меню...",
+                reply_markup=self._get_main_keyboard()
+            )
             context.user_data['in_search'] = False
             return ConversationHandler.END
-        
-        # Определяем лимит
-        if text == "5 товаров":
-            limit = 5
-        elif text == "10 товаров":
-            limit = 10
-        elif text == "15 товаров":
-            limit = 15
-        elif text == "20 товаров":
-            limit = 20
-        else:
-            await update.message.reply_text("❌ Некорректное число. Введите число от 1 до 20.")
+
+        # Обработка кнопки отмены поиска
+        if text == "❌ Отменить поиск":
+            await self.cancel_current_search()
+            await update.message.reply_text(
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+            context.user_data['in_search'] = False
+            return ConversationHandler.END
+
+        # Проверяем, что выбран допустимый лимит
+        if text not in ["5 товаров", "10 товаров", "15 товаров", "20 товаров"]:
+            await update.message.reply_text(
+                "❌ Пожалуйста, выберите количество товаров из предложенных вариантов.",
+                reply_markup=self._get_search_keyboard()
+            )
             return SEARCH_LIMIT
         
-        query = context.user_data['query']
+        # Определяем лимит
+        limit_mapping = {
+            "5 товаров": 5,
+            "10 товаров": 10, 
+            "15 товаров": 15,
+            "20 товаров": 20
+        }
+        limit = limit_mapping[text]
+        
+        query = context.user_data.get('query', '')
         platform_name = self._get_platform_display_name()
+        
+        # Показываем кнопку отмены поиска
+        cancel_keyboard = self._get_cancel_keyboard()
         
         search_msg = await update.message.reply_text(
             f"🔍 <b>Ищу {limit} товаров на {platform_name} по запросу:</b> <code>{query}</code>\n\n"
-            "⏳ Это может занять несколько секунд...",
-            parse_mode="HTML"
+            "⏳ Это может занять несколько секунд...\n"
+            "❌ Вы можете отменить поиск в любой момент",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard
         )
+        
+        # Сохраняем ID сообщения для возможного редактирования
+        context.user_data['search_message_id'] = search_msg.message_id
         
         try:
-            # Используем текущий парсер для поиска
-            products_data = await asyncio.to_thread(self.current_parser.search_products, query, limit)
+            # Отменяем предыдущий поиск если он есть
+            await self.cancel_current_search()
             
-            if not products_data:
-                await search_msg.edit_text(
-                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
-                    "💡 Попробуйте изменить запрос или сменить платформу",
-                    parse_mode="HTML"
-                )
-                context.user_data['in_search'] = False
-                return ConversationHandler.END
-            
-            # Сохраняем товары
-            saved_count = await self.current_parser.parse_and_save_async(query, limit)
-            
-            if saved_count == 0:
-                await search_msg.edit_text(
-                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
-                    "⚠️ Попробуйте другой запрос",
-                    parse_mode="HTML"
-                )
-                context.user_data['in_search'] = False
-                return ConversationHandler.END
-            
-            # Получаем сохраненные товары из базы
-            from app.models import Product
-            
-            product_ids = [str(p.get('product_id')) for p in products_data if p.get('product_id')]
-            
-            if product_ids:
-                products = await asyncio.to_thread(
-                    lambda: list(Product.objects.filter(
-                        product_id__in=product_ids, 
-                        platform=self.current_parser.platform
-                    ))
-                )
-            else:
-                products = await asyncio.to_thread(
-                    lambda: list(Product.objects.filter(
-                        platform=self.current_parser.platform
-                    ).order_by('-id')[:limit])
+            # Создаем задачу поиска
+            async with self.search_lock:
+                self.current_search_task = asyncio.create_task(
+                    self._execute_extended_search(update, context, query, limit, search_msg)
                 )
             
-            context.user_data['last_results'] = products
-            context.user_data['query'] = query
+            # Ждем завершения задачи поиска
+            await self.current_search_task
             
+        except asyncio.CancelledError:
+            # Поиск был отменен пользователем
             await search_msg.edit_text(
-                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
-                "📦 Отправляю результаты...",
-                parse_mode="HTML"
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
             )
-            
-            # Преобразуем для отправки
-            products_for_sending = []
-            for product in products:
-                products_for_sending.append({
-                    'product_id': str(product.product_id),
-                    'name': product.name,
-                    'price': float(product.price),
-                    'discount_price': float(product.discount_price) if product.discount_price else None,
-                    'rating': float(product.rating) if product.rating else 0.0,
-                    'reviews_count': product.reviews_count,
-                    'product_url': product.product_url,
-                    'image_url': product.image_url,
-                    'quantity': product.quantity,
-                    'is_available': product.is_available,
-                    'platform': product.platform
-                })
-            
-            # Сохраняем историю поиска
-            await self._save_search_history(context, query, products_for_sending, platform_name)
-            
-            # Отправляем товары
-            await self.send_all_products(update, products_for_sending)
-            
+        except asyncio.TimeoutError:
+            await search_msg.edit_text(
+                "⏰ <b>Превышено время ожидания поиска</b>\n\n"
+                "🔧 Попробуйте повторить запрос позже",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
+            )
         except Exception as e:
-            logger.error("Ошибка поиска: %s", str(e), exc_info=True)
+            logger.error("Ошибка расширенного поиска: %s", str(e), exc_info=True)
             await search_msg.edit_text(
-                f"⚠️ <b>Произошла ошибка при поиске на {platform_name}</b>\n\n"
-                "🔧 Пожалуйста, попробуйте позже",
-                parse_mode="HTML"
+                f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)}",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
             )
+        finally:
+            # Всегда сбрасываем флаги поиска
+            context.user_data['in_search'] = False
+            async with self.search_lock:
+                self.current_search_task = None
         
-        context.user_data['in_search'] = False
-        await update.message.reply_text(
-            "🎉 <b>Поиск завершен!</b>\n\n"
-            "💡 Используйте кнопки для новых запросов:",
-            parse_mode="HTML",
-            reply_markup=self._get_main_keyboard()
-        )
         return ConversationHandler.END
 
-    async def quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Быстрый поиск по введенному тексту"""
-        query = update.message.text.strip()
-        
-        if len(query) < 2:
-            await update.message.reply_text("❌ Слишком короткий запрос. Попробуйте еще раз.")
-            return
-        
+    async def _execute_extended_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                    query: str, limit: int, search_msg):
+        """Выполнение расширенного поиска с проверкой отмены"""
         platform_name = self._get_platform_display_name()
         
-        search_msg = await update.message.reply_text(
-            f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>\n\n"
-            "⏳ Это может занять несколько секунд...",
-            parse_mode="HTML"
-        )
-        
         try:
-            # Анимируем процесс поиска
+            # Анимация поиска с проверкой отмены
             dots = ["", ".", "..", "..."]
-            for i in range(3):
+            for i in range(4):
+                if self.current_search_task and self.current_search_task.cancelled():
+                    raise asyncio.CancelledError()
+                    
                 try:
                     await search_msg.edit_text(
-                        f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
-                        "⏳ Это может занять несколько секунд...",
-                        parse_mode="HTML"
+                        f"🔍 <b>Ищу {limit} товаров на {platform_name} по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
+                        "⏳ Это может занять несколько секунд...\n"
+                        "❌ Вы можете отменить поиск в любой момент",
+                        parse_mode="HTML",
+                        reply_markup=self._get_cancel_keyboard()
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(0.5)
+                
+                await asyncio.sleep(0.4)
             
-            # Ищем товары
-            raw_products = await asyncio.to_thread(self.current_parser.search_products, query, 10)
+            # Проверяем отмену перед началом тяжелой работы
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            # Выполняем поиск в отдельном потоке
+            loop = asyncio.get_event_loop()
+            raw_products = await asyncio.wait_for(
+                loop.run_in_executor(self.executor, self.current_parser.search_products, query, limit),
+                timeout=25.0
+            )
+            
+            # Проверяем отмену после поиска
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
             
             if not raw_products:
                 await search_msg.edit_text(
                     f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
                     "💡 Попробуйте изменить запрос или сменить платформу",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
                 )
                 return
             
             # Сохраняем товары
-            saved_count = await self.current_parser.parse_and_save_async(query, 10)
+            saved_count = await self.current_parser.parse_and_save_async(query, limit)
+            
+            # Проверяем отмену после сохранения
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
             
             if saved_count == 0:
                 await search_msg.edit_text(
                     f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
                     "⚠️ Попробуйте другой запрос",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
                 )
                 return
             
             # Получаем товары из базы
             from app.models import Product
             
-            product_ids = []
-            for p in raw_products:
-                pid = p.get('product_id')
-                if pid:
-                    product_ids.append(str(pid))
+            product_ids = [str(p.get('product_id')) for p in raw_products if p.get('product_id')]
             
             if product_ids:
-                products = await asyncio.to_thread(
+                products = await loop.run_in_executor(
+                    self.executor,
                     lambda: list(Product.objects.filter(
                         product_id__in=product_ids, 
                         platform=self.current_parser.platform
                     ))
                 )
             else:
-                products = await asyncio.to_thread(
+                products = await loop.run_in_executor(
+                    self.executor,
                     lambda: list(Product.objects.filter(
                         platform=self.current_parser.platform
-                    ).order_by('-id')[:10])
+                    ).order_by('-id')[:limit])
                 )
+            
+            # Проверяем отмену перед отправкой результатов
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
             
             if not products:
                 await search_msg.edit_text(
                     f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
                     "⚠️ Попробуйте еще раз",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
                 )
                 return
             
+            # Сохраняем результаты в context
             context.user_data['last_results'] = products
             context.user_data['query'] = query
             
@@ -834,19 +922,235 @@ class MultiPlatformBot:
                 })
             
             # Сохраняем историю поиска
-            await self._save_search_history(context, query, products_for_sending, platform_name)
+            platform_name_display = self._get_platform_display_name()
+            await self._save_search_history(context, query, products_for_sending, platform_name_display)
+            
+            # Проверяем отмену перед отправкой товаров
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
             
             # Отправляем товары
             await self.send_all_products(update, products_for_sending)
             
+            # Финальное сообщение
+            await update.message.reply_text(
+                f"🎉 <b>Поиск завершен! Найдено {saved_count} товаров</b>\n\n"
+                "💡 Используйте кнопки для новых запросов:",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
+            )
+            
+        except asyncio.CancelledError:
+            raise  # Пробрасываем отмену выше
         except Exception as e:
-            logger.error("Ошибка поиска: %s", str(e), exc_info=True)
+            logger.error("Ошибка выполнения расширенного поиска: %s", str(e), exc_info=True)
+            raise
+
+    async def quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Быстрый поиск с мгновенной отменой"""
+        query = update.message.text.strip()
+        
+        if query == "❌ Отменить поиск":
+            await self.cancel_current_search()
+            await update.message.reply_text(
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+            return
+        
+        if len(query) < 2:
+            await update.message.reply_text("❌ Слишком короткий запрос. Попробуйте еще раз.")
+            return
+        
+        # Отменяем предыдущий поиск если он есть
+        await self.cancel_current_search()
+        
+        # Показываем кнопку отмены
+        cancel_keyboard = self._get_quick_search_keyboard()
+        
+        platform_name = self._get_platform_display_name()
+        
+        search_msg = await update.message.reply_text(
+            f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>\n\n"
+            "⏳ Это может занять несколько секунд...\n"
+            "❌ Вы можете отменить поиск в любой момент",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard
+        )
+        
+        # Создаем задачу поиска и передаем context
+        async with self.search_lock:
+            self.current_search_task = asyncio.create_task(
+                self._execute_quick_search(update, context, query, search_msg)
+            )
+        
+        try:
+            await self.current_search_task
+        except asyncio.CancelledError:
+            # Поиск был отменен - это нормально
             await search_msg.edit_text(
-                f"⚠️ <b>Произошла ошибка при поиске на {platform_name}</b>\n\n"
-                "🔧 Пожалуйста, попробуйте позже",
-                parse_mode="HTML"
+                "❌ Поиск отменен.",
+                reply_markup=self._get_main_keyboard()
+            )
+        except Exception as e:
+            logger.error("Ошибка быстрого поиска: %s", str(e))
+            await search_msg.edit_text(
+                f"⚠️ <b>Ошибка поиска:</b> {str(e)}",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
             )
 
+    async def _execute_quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, search_msg):
+        """Выполнение быстрого поиска с проверкой отмены"""
+        try:
+            platform_name = self._get_platform_display_name()
+            
+            # Анимация поиска с проверкой отмены
+            dots = ["", ".", "..", "..."]
+            for i in range(6):
+                if self.current_search_task and self.current_search_task.cancelled():
+                    raise asyncio.CancelledError()
+                    
+                try:
+                    await search_msg.edit_text(
+                        f"🔍 <b>Ищу товары на {platform_name} по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
+                        "⏳ Это может занять несколько секунд...\n"
+                        "❌ Вы можете отменить поиск в любой момент",
+                        parse_mode="HTML",
+                        reply_markup=self._get_quick_search_keyboard()
+                    )
+                except Exception:
+                    pass
+                
+                await asyncio.sleep(0.3)
+            
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            # Выполняем поиск в отдельном потоке
+            loop = asyncio.get_event_loop()
+            raw_products = await asyncio.wait_for(
+                loop.run_in_executor(self.executor, self.current_parser.search_products, query, 10),
+                timeout=30.0
+            )
+            
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            if not raw_products:
+                await search_msg.edit_text(
+                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
+                    "💡 Попробуйте изменить запрос или сменить платформу",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+                return
+            
+            # Сохраняем товары (теперь context доступен)
+            saved_count = await self.current_parser.parse_and_save_async(query, 10)
+            
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            if saved_count == 0:
+                await search_msg.edit_text(
+                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
+                    "⚠️ Попробуйте другой запрос",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+                return
+            
+            # Получаем товары из базы
+            from app.models import Product
+            
+            product_ids = [str(p.get('product_id')) for p in raw_products if p.get('product_id')]
+            
+            if product_ids:
+                products = await loop.run_in_executor(
+                    self.executor,
+                    lambda: list(Product.objects.filter(
+                        product_id__in=product_ids, 
+                        platform=self.current_parser.platform
+                    ))
+                )
+            else:
+                products = await loop.run_in_executor(
+                    self.executor,
+                    lambda: list(Product.objects.filter(
+                        platform=self.current_parser.platform
+                    ).order_by('-id')[:10])
+                )
+            
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            if not products:
+                await search_msg.edit_text(
+                    f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
+                    "⚠️ Попробуйте еще раз",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+                return
+            
+            # Сохраняем в context (теперь он доступен)
+            context.user_data['last_results'] = products
+            context.user_data['query'] = query
+            
+            await search_msg.edit_text(
+                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
+                "📦 Отправляю результаты...",
+                parse_mode="HTML"
+            )
+            
+            # Преобразуем в формат для отправки
+            products_for_sending = []
+            for product in products:
+                products_for_sending.append({
+                    'product_id': str(product.product_id),
+                    'name': product.name,
+                    'price': float(product.price),
+                    'discount_price': float(product.discount_price) if product.discount_price else None,
+                    'rating': float(product.rating) if product.rating else 0.0,
+                    'reviews_count': product.reviews_count,
+                    'product_url': product.product_url,
+                    'image_url': product.image_url,
+                    'quantity': product.quantity,
+                    'is_available': product.is_available,
+                    'platform': product.platform
+                })
+            
+            # Сохраняем историю поиска (context доступен)
+            platform_name_display = self._get_platform_display_name()
+            await self._save_search_history(context, query, products_for_sending, platform_name_display)
+            
+            if self.current_search_task and self.current_search_task.cancelled():
+                raise asyncio.CancelledError()
+            
+            # Отправляем товары
+            await self.send_all_products(update, products_for_sending)
+            
+            await update.message.reply_text(
+                "🎉 <b>Поиск завершен!</b>\n\n"
+                "💡 Используйте кнопки для новых запросов:",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
+            )
+            
+        except asyncio.TimeoutError:
+            await search_msg.edit_text(
+                "⏰ <b>Превышено время ожидания поиска</b>\n\n"
+                "🔧 Попробуйте повторить запрос позже",
+                parse_mode="HTML",
+                reply_markup=self._get_main_keyboard()
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Ошибка выполнения поиска: %s", str(e))
+            raise
+    
     async def send_all_products(self, update: Update, products: List[dict]) -> None:
         """Отправка всех товаров по одному в сообщении"""
         if not products:
@@ -1097,9 +1401,15 @@ class MultiPlatformBot:
         is_available = product.get('is_available', False)
         platform = product.get('platform', 'WB')
         
-        # Определяем эмодзи платформы
-        platform_emoji = "🛍️" if platform == 'WB' else "🟠"
-        platform_name = "Wildberries" if platform == 'WB' else "Ozon"
+        # ПРАВИЛЬНОЕ определение платформы
+        if platform in ['wildberries', 'WB', 'Wildberries']:
+            platform_emoji = "🛍️"
+            platform_name = "Wildberries"
+            platform_hashtag = "#wildberries"
+        else:  # Ozon
+            platform_emoji = "🟠" 
+            platform_name = "Ozon"
+            platform_hashtag = "#ozon"
         
         # Форматируем цены
         price_str = f"<b>{price:,.0f} ₽</b>".replace(',', ' ')
@@ -1146,10 +1456,15 @@ class MultiPlatformBot:
         
         # Блок с навигацией и ссылкой
         text += f"🔢 <b>Товар {current_index + 1} из {total_count}</b>\n"
-        text += f"🔗 <a href='{product_url}'>Перейти к товару на {platform_name}</a>\n\n"
+        
+        # Проверяем, что URL не пустой
+        if product_url and product_url.startswith('http'):
+            text += f"🔗 <a href='{product_url}'>Перейти к товару на {platform_name}</a>\n\n"
+        else:
+            text += f"🔗 Ссылка на товар недоступна\n\n"
         
         # Добавляем хештеги
-        hashtags = [f"#{platform_name.lower()}"]
+        hashtags = [platform_hashtag]
         if discount_price and discount_price < price:
             hashtags.append("#скидка")
         
@@ -1163,8 +1478,12 @@ class MultiPlatformBot:
                 f"💰 <b>Цена:</b> {price_str}\n",
                 f"📦 <b>В наличии:</b> {quantity} шт.\n" if quantity and quantity > 0 else "✅ <b>В наличии</b>\n",
                 f"⭐ <b>Рейтинг:</b> {rating:.1f}/5.0\n" if rating > 0 else "",
-                f"🔗 <a href='{product_url}'>Перейти к товару</a>"
             ]
+            
+            # Добавляем ссылку только если она валидна
+            if product_url and product_url.startswith('http'):
+                important_parts.append(f"🔗 <a href='{product_url}'>Перейти к товару</a>")
+            
             text = "".join(important_parts)
             
             if len(text) > 1024:
@@ -1553,7 +1872,10 @@ class Command(BaseCommand):
                 SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.receive_query)],
                 SEARCH_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.receive_limit)],
             },
-            fallbacks=[CommandHandler("cancel", bot.cancel)],
+            fallbacks=[
+                CommandHandler("cancel", bot.cancel),
+                MessageHandler(filters.Regex("^❌ Отменить поиск$"), bot.cancel_search),
+            ],
         )
         application.add_handler(conv_handler)
         
@@ -1567,13 +1889,31 @@ class Command(BaseCommand):
         asyncio.set_event_loop(loop)
         
         try:
+            # Инициализируем бота
             loop.run_until_complete(bot.init_session())
-            application.run_polling()
+            
+            # Запускаем бота в отдельной задаче
+            bot_task = loop.create_task(application.run_polling())
+            
+            # Ждем завершения работы бота
+            loop.run_until_complete(bot_task)
             
         except KeyboardInterrupt:
             self.stdout.write(self.style.WARNING('Бот остановлен пользователем'))
         except Exception as e:
             self.stdout.write(self.style.ERROR(f'Ошибка: {e}'))
         finally:
-            loop.run_until_complete(bot.close_session())
-            loop.close()
+            try:
+                # Корректно закрываем сессии
+                if not loop.is_closed():
+                    close_task = loop.create_task(bot.close_session())
+                    loop.run_until_complete(asyncio.wait_for(close_task, timeout=5.0))
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f'Ошибка при закрытии: {e}'))
+            finally:
+                # Всегда закрываем loop
+                try:
+                    if not loop.is_closed():
+                        loop.close()
+                except:
+                    pass
