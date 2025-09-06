@@ -19,6 +19,7 @@ import aiohttp
 from datetime import datetime
 import sys
 from logging.handlers import RotatingFileHandler
+from .user_service import UserService
 
 class IgnoreUnicodeErrorsHandler(logging.StreamHandler):
     def emit(self, record):
@@ -96,6 +97,7 @@ class MultiPlatformBot:
         self.session = None
         self.current_search_task = None  # Текущая задача поиска
         self.search_lock = asyncio.Lock()
+        self.user_service = UserService()
     
     async def init_session(self):
         """Инициализация сессии в асинхронном контексте"""
@@ -200,6 +202,10 @@ class MultiPlatformBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Инициализируем данные пользователя
+        user, created = await self.user_service.get_or_create_telegram_user(update)
+        if user:
+            context.user_data['db_user'] = user  # Сохраняем объект пользователя в context
+            await self.user_service.update_user_activity(user.user_id)
         context.user_data.setdefault('search_history', [])
         context.user_data.setdefault('preferred_platform', 'WB')
         
@@ -429,9 +435,23 @@ class MultiPlatformBot:
 
     async def handle_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обработка подтверждения очистки истории"""
-        text = update.message.text.strip()
+        text = update.message.text.strip()  # Вот здесь text определяется!
         
         if text == "✅ Да, очистить историю":
+            user = context.user_data.get('db_user')
+            if user:
+                try:
+                    from asgiref.sync import sync_to_async
+                    from app.models import UserSearchHistory
+                    # УДАЛЯЕМ ИСТОРИЮ ПОЛЬЗОВАТЕЛЯ ИЗ БАЗЫ ДАННЫХ
+                    await sync_to_async(
+                        lambda: UserSearchHistory.objects.filter(user=user).delete()
+                    )()
+                    logger.info(f"История поиска очищена для user_id={user.user_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка очистки истории из БД: {e}")
+            
+            # Также очищаем локальный кеш
             context.user_data['search_history'] = []
             context.user_data['awaiting_confirmation'] = False
             
@@ -769,24 +789,45 @@ class MultiPlatformBot:
             
         except asyncio.CancelledError:
             # Поиск был отменен пользователем
-            await search_msg.edit_text(
-                "❌ Поиск отменен.",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    "❌ Поиск отменен.",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                # Если не удалось отредактировать, отправляем новое сообщение
+                await update.message.reply_text(
+                    "❌ Поиск отменен.",
+                    reply_markup=self._get_main_keyboard()
+                )
         except asyncio.TimeoutError:
-            await search_msg.edit_text(
-                "⏰ <b>Превышено время ожидания поиска</b>\n\n"
-                "🔧 Попробуйте повторить запрос позже",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    "⏰ <b>Превышено время ожидания поиска</b>\n\n"
+                    "🔧 Попробуйте повторить запрос позже",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                await update.message.reply_text(
+                    "⏰ <b>Превышено время ожидания поиска</b>",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
         except Exception as e:
             logger.error("Ошибка расширенного поиска: %s", str(e), exc_info=True)
-            await search_msg.edit_text(
-                f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)}",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                await update.message.reply_text(
+                    f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
         finally:
             # Всегда сбрасываем флаги поиска
             context.user_data['in_search'] = False
@@ -796,7 +837,7 @@ class MultiPlatformBot:
         return ConversationHandler.END
 
     async def _execute_extended_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                                    query: str, limit: int, search_msg):
+                                query: str, limit: int, search_msg):
         """Выполнение расширенного поиска с проверкой отмены"""
         platform_name = self._get_platform_display_name()
         
@@ -808,6 +849,7 @@ class MultiPlatformBot:
                     raise asyncio.CancelledError()
                     
                 try:
+                    # Используем try/except для обработки ошибок редактирования
                     await search_msg.edit_text(
                         f"🔍 <b>Ищу {limit} товаров на {platform_name} по запросу:</b> <code>{query}</code>{dots[i % 4]}\n\n"
                         "⏳ Это может занять несколько секунд...\n"
@@ -815,8 +857,9 @@ class MultiPlatformBot:
                         parse_mode="HTML",
                         reply_markup=self._get_cancel_keyboard()
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Не удалось обновить сообщение поиска: {e}")
+                    # Продолжаем выполнение, даже если не удалось обновить сообщение
                 
                 await asyncio.sleep(0.4)
             
@@ -836,12 +879,20 @@ class MultiPlatformBot:
                 raise asyncio.CancelledError()
             
             if not raw_products:
-                await search_msg.edit_text(
-                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
-                    "💡 Попробуйте изменить запрос или сменить платформу",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
+                        "💡 Попробуйте изменить запрос или сменить платформу",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    # Если не удалось отредактировать, отправляем новое сообщение
+                    await update.message.reply_text(
+                        f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
             # Сохраняем товары
@@ -852,12 +903,19 @@ class MultiPlatformBot:
                 raise asyncio.CancelledError()
             
             if saved_count == 0:
-                await search_msg.edit_text(
-                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
-                    "⚠️ Попробуйте другой запрос",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
+                        "⚠️ Попробуйте другой запрос",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ <b>Не удалось сохранить товары с {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
             # Получаем товары из базы
@@ -886,23 +944,34 @@ class MultiPlatformBot:
                 raise asyncio.CancelledError()
             
             if not products:
-                await search_msg.edit_text(
-                    f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
-                    "⚠️ Попробуйте еще раз",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
+                        "⚠️ Попробуйте еще раз",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ <b>Не удалось загрузить товары с {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
             # Сохраняем результаты в context
             context.user_data['last_results'] = products
             context.user_data['query'] = query
             
-            await search_msg.edit_text(
-                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
-                "📦 Отправляю результаты...",
-                parse_mode="HTML"
-            )
+            try:
+                await search_msg.edit_text(
+                    f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
+                    "📦 Отправляю результаты...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                # Если не удалось отредактировать, просто продолжаем
+                pass
             
             # Преобразуем в формат для отправки
             products_for_sending = []
@@ -923,7 +992,7 @@ class MultiPlatformBot:
             
             # Сохраняем историю поиска
             platform_name_display = self._get_platform_display_name()
-            await self._save_search_history(context, query, products_for_sending, platform_name_display)
+            await self._save_search_history(update, context, query, products_for_sending, platform_name_display)
             
             # Проверяем отмену перед отправкой товаров
             if self.current_search_task and self.current_search_task.cancelled():
@@ -944,6 +1013,20 @@ class MultiPlatformBot:
             raise  # Пробрасываем отмену выше
         except Exception as e:
             logger.error("Ошибка выполнения расширенного поиска: %s", str(e), exc_info=True)
+            # Отправляем сообщение об ошибке, если поиск не был отменен
+            if not (self.current_search_task and self.current_search_task.cancelled()):
+                try:
+                    await search_msg.edit_text(
+                        f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
             raise
 
     async def quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -988,17 +1071,30 @@ class MultiPlatformBot:
             await self.current_search_task
         except asyncio.CancelledError:
             # Поиск был отменен - это нормально
-            await search_msg.edit_text(
-                "❌ Поиск отменен.",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    "❌ Поиск отменен.",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Поиск отменен.",
+                    reply_markup=self._get_main_keyboard()
+                )
         except Exception as e:
             logger.error("Ошибка быстрого поиска: %s", str(e))
-            await search_msg.edit_text(
-                f"⚠️ <b>Ошибка поиска:</b> {str(e)}",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    f"⚠️ <b>Ошибка поиска:</b> {str(e)[:100]}...",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                await update.message.reply_text(
+                    f"⚠️ <b>Ошибка поиска:</b> {str(e)[:100]}...",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
 
     async def _execute_quick_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, search_msg):
         """Выполнение быстрого поиска с проверкой отмены"""
@@ -1020,6 +1116,7 @@ class MultiPlatformBot:
                         reply_markup=self._get_quick_search_keyboard()
                     )
                 except Exception:
+                    # Пропускаем ошибки редактирования, продолжаем поиск
                     pass
                 
                 await asyncio.sleep(0.3)
@@ -1038,27 +1135,41 @@ class MultiPlatformBot:
                 raise asyncio.CancelledError()
             
             if not raw_products:
-                await search_msg.edit_text(
-                    f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
-                    "💡 Попробуйте изменить запрос или сменить платформу",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>\n\n"
+                        "💡 Попробуйте изменить запрос или сменить платформу",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ <b>По запросу</b> <code>{query}</code> <b>ничего не найдено на {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
-            # Сохраняем товары (теперь context доступен)
+            # Сохраняем товары
             saved_count = await self.current_parser.parse_and_save_async(query, 10)
             
             if self.current_search_task and self.current_search_task.cancelled():
                 raise asyncio.CancelledError()
             
             if saved_count == 0:
-                await search_msg.edit_text(
-                    f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
-                    "⚠️ Попробуйте другой запрос",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>Не удалось сохранить товары с {platform_name}</b>\n\n"
+                        "⚠️ Попробуйте другой запрос",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ <b>Не удалось сохранить товары с {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
             # Получаем товары из базы
@@ -1086,23 +1197,34 @@ class MultiPlatformBot:
                 raise asyncio.CancelledError()
             
             if not products:
-                await search_msg.edit_text(
-                    f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
-                    "⚠️ Попробуйте еще раз",
-                    parse_mode="HTML",
-                    reply_markup=self._get_main_keyboard()
-                )
+                try:
+                    await search_msg.edit_text(
+                        f"❌ <b>Не удалось загрузить товары с {platform_name}</b>\n\n"
+                        "⚠️ Попробуйте еще раз",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ <b>Не удалось загрузить товары с {platform_name}</b>",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
                 return
             
-            # Сохраняем в context (теперь он доступен)
+            # Сохраняем в context
             context.user_data['last_results'] = products
             context.user_data['query'] = query
             
-            await search_msg.edit_text(
-                f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
-                "📦 Отправляю результаты...",
-                parse_mode="HTML"
-            )
+            try:
+                await search_msg.edit_text(
+                    f"✅ <b>Найдено и сохранено {saved_count} товаров с {platform_name}</b>\n\n"
+                    "📦 Отправляю результаты...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                # Если не удалось отредактировать, просто продолжаем
+                pass
             
             # Преобразуем в формат для отправки
             products_for_sending = []
@@ -1121,9 +1243,9 @@ class MultiPlatformBot:
                     'platform': product.platform
                 })
             
-            # Сохраняем историю поиска (context доступен)
+            # Сохраняем историю поиска
             platform_name_display = self._get_platform_display_name()
-            await self._save_search_history(context, query, products_for_sending, platform_name_display)
+            await self._save_search_history(update, context, query, products_for_sending, platform_name_display)
             
             if self.current_search_task and self.current_search_task.cancelled():
                 raise asyncio.CancelledError()
@@ -1139,16 +1261,37 @@ class MultiPlatformBot:
             )
             
         except asyncio.TimeoutError:
-            await search_msg.edit_text(
-                "⏰ <b>Превышено время ожидания поиска</b>\n\n"
-                "🔧 Попробуйте повторить запрос позже",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
+            try:
+                await search_msg.edit_text(
+                    "⏰ <b>Превышено время ожидания поиска</b>\n\n"
+                    "🔧 Попробуйте повторить запрос позже",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+            except Exception:
+                await update.message.reply_text(
+                    "⏰ <b>Превышено время ожидания поиска</b>",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Ошибка выполнения поиска: %s", str(e))
+            # Отправляем сообщение об ошибке, если поиск не был отменен
+            if not (self.current_search_task and self.current_search_task.cancelled()):
+                try:
+                    await search_msg.edit_text(
+                        f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
+                except Exception:
+                    await update.message.reply_text(
+                        f"⚠️ <b>Произошла ошибка при поиске:</b>\n{str(e)[:100]}...",
+                        parse_mode="HTML",
+                        reply_markup=self._get_main_keyboard()
+                    )
             raise
     
     async def send_all_products(self, update: Update, products: List[dict]) -> None:
@@ -1560,89 +1703,126 @@ class MultiPlatformBot:
         )
 
     async def history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показ истории поиска с информацией о платформах"""
-        search_history = context.user_data.get('search_history', [])
-        
-        # Фильтруем историю
-        filtered_history = []
-        for item in search_history:
-            query = item.get('query', '')
-            if query not in ["🔄 Вернуться к истории", "✅ Да, очистить историю", "❌ Нет, отменить"]:
-                filtered_history.append(item)
-        
-        context.user_data['search_history'] = filtered_history[:15]
-        
-        if not filtered_history:
-            await update.message.reply_text(
-                "📝 <b>История поиска пуста</b>\n\n"
-                "🔍 Выполните поиск товаров, чтобы сохранить историю запросов",
-                parse_mode="HTML",
-                reply_markup=self._get_main_keyboard()
-            )
-            return
-        
-        # Сортируем историю по времени
-        sorted_history = sorted(filtered_history, 
-                            key=lambda x: x.get('timestamp', ''), 
-                            reverse=True)
-        
-        # Формируем текст
-        text = "✨ <b>ИСТОРИЯ ПОИСКА</b>\n\n"
-        
-        for i, history_item in enumerate(sorted_history[:10], 1):
-            query = history_item.get('query', 'Неизвестно')
-            timestamp = history_item.get('timestamp', '')
-            count = history_item.get('results_count', 0)
-            platform = history_item.get('platform', 'Неизвестно')
-            
-            platform_emoji = "🛍️" if platform == 'Wildberries 🛍️' or platform == 'WB' else "🟠"
-            platform_name = "Wildberries" if platform == 'Wildberries 🛍️' or platform == 'WB' else "Ozon"
-            
-            text += f"🔍 <b>Запрос {i}:</b> <code>{query}</code>\n"
-            text += f"   📦 Найдено товаров: <b>{count}</b>\n"
-            text += f"   🏪 Платформа: {platform_name} {platform_emoji}\n"
-            text += f"   🕒 Время: {timestamp}\n"
-            
-            if i < min(10, len(sorted_history)):
-                text += "   ───────────────────\n"
-            text += "\n"
-        
-        text += "💡 <i>Нажмите на запрос ниже чтобы посмотреть товары</i>"
-        
-        # Создаем клавиатуру
-        keyboard = []
-        for history_item in sorted_history[:5]:
-            query = history_item.get('query', '')
-            platform = history_item.get('platform', '')
-            
-            platform_emoji = "🛍️" if platform == 'Wildberries 🛍️' or platform == 'WB' else "🟠"
-            display_query = query[:15] + "..." if len(query) > 18 else query
-            button_text = f"{platform_emoji} {display_query}"
-            
-            keyboard.append([KeyboardButton(f"🔍 {display_query}")])
-        
-        keyboard.append([KeyboardButton("🧹 Очистить историю")])
-        keyboard.append([KeyboardButton("↩️ Назад в меню")])
-        
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
+        """Показ истории поиска из БД"""
+        user = context.user_data.get('db_user')
+        if not user:
+            try:
+                user, created = await self.user_service.get_or_create_telegram_user(update)
+                context.user_data['db_user'] = user
+            except Exception as e:
+                logger.error(f"Ошибка получения пользователя для показа истории: {e}")
+                await update.message.reply_text("❌ Ошибка загрузки истории.")
+                return
 
-    async def _save_search_history(self, context: ContextTypes.DEFAULT_TYPE, query: str, 
-                                 products: list, platform_name: str):
-        """Сохранение истории поиска с информацией о платформе"""
+        try:
+            # ЗАГРУЖАЕМ ИСТОРИЮ ИЗ БАЗЫ ДАННЫХ
+            user_stats = await self.user_service.get_user_stats(user.user_id)
+            # Или напрямую через модель, если нужен детальный список:
+            from asgiref.sync import sync_to_async
+            from app.models import UserSearchHistory
+            
+            # Получаем последние N записей истории поиска для пользователя
+            search_history_db = await sync_to_async(
+                lambda: list(
+                    UserSearchHistory.objects.filter(user=user).order_by('-created_at')[:10]
+                )
+            )()
+            
+            if not search_history_db:
+                await update.message.reply_text(
+                    "📝 <b>История поиска пуста</b>\n\n"
+                    "🔍 Выполните поиск товаров, чтобы сохранить историю запросов",
+                    parse_mode="HTML",
+                    reply_markup=self._get_main_keyboard()
+                )
+                return
+
+            # Формируем текст из данных БД
+            text = "✨ <b>ИСТОРИЯ ПОИСКА (из БД)</b>\n\n"
+            for i, history_item in enumerate(search_history_db, 1):
+                query = history_item.query
+                timestamp = history_item.created_at.strftime("%d.%m.%Y в %H:%M") # Форматируем дату из БД
+                count = history_item.results_count
+                platform_code = history_item.platform
+                platform_name = "Wildberries 🛍️" if platform_code == 'WB' else "Ozon 🟠"
+                
+                text += f"🔍 <b>Запрос {i}:</b> <code>{query}</code>\n"
+                text += f"   📦 Найдено товаров: <b>{count}</b>\n"
+                text += f"   🏪 Платформа: {platform_name}\n"
+                text += f"   🕒 Время: {timestamp}\n\n"
+            
+            text += "💡 <i>Нажмите на запрос ниже чтобы посмотреть товары</i>"
+            
+            # Создаем клавиатуру из запросов, полученных из БД
+            keyboard = []
+            for history_item in search_history_db[:5]:
+                query = history_item.query
+                display_query = query[:15] + "..." if len(query) > 18 else query
+                keyboard.append([KeyboardButton(f"🔍 {display_query}")])
+            
+            keyboard.append([KeyboardButton("🧹 Очистить историю")])
+            keyboard.append([KeyboardButton("↩️ Назад в меню")])
+            
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки истории из БД: {e}")
+            await update.message.reply_text("❌ Ошибка загрузки истории поиска.")
+
+    async def _save_search_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, 
+                             products: list, platform_name: str):
+        """Сохранение истории поиска в БД с информацией о платформе"""
+        
         if query in ["🔄 Вернуться к истории", "✅ Да, очистить историю", "❌ Нет, отменить"]:
             return
         
+        # Получаем пользователя из context или создаем нового
+        user = context.user_data.get('db_user')
+        if not user:
+            try:
+                user, created = await self.user_service.get_or_create_telegram_user(update)
+                if not user:
+                    logger.error("Не удалось получить или создать пользователя")
+                    return
+                context.user_data['db_user'] = user
+            except Exception as e:
+                logger.error(f"Ошибка получения пользователя для сохранения истории: {e}")
+                return
+        
+        # Проверяем, что user не None
+        if user is None:
+            logger.error("Объект пользователя равен None")
+            return
+        
+        user_id = user.user_id
+        results_count = len(products)
+        
+        # Сохраняем запись о поиске в базу данных
+        try:
+            # Используем код платформы вместо отображаемого имени
+            platform_code = 'WB' if 'Wildberries' in platform_name else 'OZ'
+            
+            await self.user_service.save_search_history(
+                user_id=user_id,
+                query=query,
+                platform=platform_code,
+                results_count=results_count
+            )
+            logger.info(f"История поиска сохранена для user_id={user_id}, запрос='{query}'")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения истории поиска в БД: {e}")
+        
+        # Сохраняем в локальный кеш для текущей сессии
         if 'search_history' not in context.user_data:
             context.user_data['search_history'] = []
         
         history = context.user_data['search_history']
-        
         timestamp = datetime.now().strftime("%d.%m.%Y в %H:%M")
         
         # Удаляем старые записи с таким же запросом и платформой
@@ -1653,14 +1833,14 @@ class MultiPlatformBot:
         # Добавляем новую запись
         history.insert(0, {
             'query': query,
-            'results_count': len(products),
-            'products': products[:10],
+            'results_count': results_count,
+            'products': products[:10], # Сохраняем продукты для контекста сессии
             'timestamp': timestamp,
             'platform': platform_name
         })
         
         # Ограничиваем историю
-        context.user_data['search_history'] = history[:30]
+        context.user_data['search_history'] = history[:10]
 
     async def platform_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Команда для смены платформы"""

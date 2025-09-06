@@ -2,6 +2,7 @@ from django.db import models
 from django.utils import timezone
 from django.utils.safestring import mark_safe
 from django.contrib.auth.models import User
+from .managers import TelegramUserManager
 
 class Platform(models.TextChoices):
     WILDBERRIES = 'WB', 'Wildberries'
@@ -216,3 +217,68 @@ class ProductImage(models.Model):
     def __str__(self):
         return f"Изображение для {self.product.name[:30]}"
     
+class TelegramUser(models.Model):
+    user_id = models.BigIntegerField(unique=True, primary_key=True)
+    username = models.CharField(max_length=100, null=True, blank=True)
+    first_name = models.CharField(max_length=100, null=True, blank=True)
+    last_name = models.CharField(max_length=100, null=True, blank=True)
+    language_code = models.CharField(max_length=10, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_activity = models.DateTimeField(auto_now=True)
+    
+    # Статистика
+    search_count = models.IntegerField(default=0)
+    products_viewed = models.IntegerField(default=0)
+    
+    objects = TelegramUserManager()
+
+    class Meta:
+        verbose_name = "Telegram пользователь"
+        verbose_name_plural = "Telegram пользователи"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.first_name} ({self.user_id})"
+
+class UserSession(models.Model):
+        """Модель для хранения сессий пользователей"""
+        user = models.ForeignKey(TelegramUser, on_delete=models.CASCADE, related_name='sessions')
+        session_id = models.CharField(max_length=100, unique=True)
+        created_at = models.DateTimeField(auto_now_add=True)
+        last_activity = models.DateTimeField(auto_now=True)
+        is_active = models.BooleanField(default=True)
+        platform = models.CharField(max_length=20, default='WB')  # Предпочтительная платформа
+        
+        class Meta:
+            indexes = [
+                models.Index(fields=['user', 'is_active']),
+                models.Index(fields=['last_activity']),
+            ]
+
+class UserSearchHistory(models.Model):
+        """История поисковых запросов пользователя"""
+        user = models.ForeignKey(TelegramUser, on_delete=models.CASCADE, related_name='search_history')
+        query = models.CharField(max_length=255)
+        platform = models.CharField(max_length=20)
+        results_count = models.IntegerField(default=0)
+        created_at = models.DateTimeField(auto_now_add=True)
+        
+        class Meta:
+            indexes = [
+                models.Index(fields=['user', 'created_at']),
+                models.Index(fields=['query']),
+            ]
+            ordering = ['-created_at']
+
+    # Обновляем модель PriceAlert чтобы связать с TelegramUser
+class PriceAlert(models.Model):
+        user = models.ForeignKey(TelegramUser, on_delete=models.CASCADE, related_name='alerts')
+        product = models.ForeignKey(Product, on_delete=models.CASCADE)
+        target_price = models.DecimalField(max_digits=10, decimal_places=2)
+        is_active = models.BooleanField(default=True)
+        created_at = models.DateTimeField(auto_now_add=True)
+        triggered = models.BooleanField(default=False)
+        triggered_at = models.DateTimeField(null=True, blank=True)
+        
+        class Meta:
+            unique_together = ['user', 'product']
